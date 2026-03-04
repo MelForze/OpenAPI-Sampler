@@ -1,0 +1,13 @@
+name: OpenAPI Parser
+version: 2.0.9
+author: MelForze
+repo_url: https://github.com/melforze/openapi-parser
+extension_type: java
+entry_point: burp.openapi.OpenApiParserExtension
+minimum_burp_version: 2025.1
+minimum_java_version: 17
+short_description: Parse OpenAPI/Swagger specs and generate testing requests for Burp tools.
+long_description: |
+  OpenAPI Parser loads OpenAPI 2.0/3.0/3.1 specs from file, URL, or context menu,
+  renders all operations in a searchable table, and sends generated requests directly
+  to Repeater and Intruder. It also exports cURL and Python requests.
