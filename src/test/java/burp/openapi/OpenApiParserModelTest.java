@@ -87,6 +87,44 @@ final class OpenApiParserModelTest
     }
 
     @Test
+    void dedupeIsScopedPerSourceAndSameOperationInDifferentSourcesIsPreserved()
+    {
+        OpenApiParserModel model = new OpenApiParserModel();
+        OpenAPI users = singleGetSpec("https://api.one.test", "/users", "usersList", "List users");
+
+        model.load(users, "https://api.one.test/openapi.json", "one");
+        model.load(users, "https://api.one.test/openapi.json", "one");
+        model.load(users, "https://api.two.test/openapi.json", "two");
+
+        assertEquals(2, model.operations().size());
+        assertEquals(
+                1,
+                model.operations().stream().filter(op -> "https://api.one.test/openapi.json".equals(op.sourceId())).count()
+        );
+        assertEquals(
+                1,
+                model.operations().stream().filter(op -> "https://api.two.test/openapi.json".equals(op.sourceId())).count()
+        );
+    }
+
+    @Test
+    void filterSupportsSourceIsolationAndSourceScopedServers()
+    {
+        OpenApiParserModel model = new OpenApiParserModel();
+        model.load(singleGetSpec("https://api.one.test", "/users", "users", "Users"), "https://api.one.test/openapi.json", "one");
+        model.load(singleGetSpec("https://api.two.test", "/orders", "orders", "Orders"), "https://api.two.test/openapi.json", "two");
+
+        assertEquals(2, model.operations().size());
+        assertEquals(1, model.filter("", null, "https://api.one.test/openapi.json").size());
+        assertEquals(1, model.filter("", null, "https://api.two.test/openapi.json").size());
+        assertEquals("/users", model.filter("", null, "https://api.one.test/openapi.json").get(0).path());
+
+        assertEquals(List.of("https://api.one.test"), model.availableServers("https://api.one.test/openapi.json"));
+        assertEquals(List.of("https://api.two.test"), model.availableServers("https://api.two.test/openapi.json"));
+        assertEquals(2, model.availableSources().size());
+    }
+
+    @Test
     void loadResolvesServerVariablesAndRelativeUrls()
     {
         OpenApiParserModel model = new OpenApiParserModel();
@@ -109,6 +147,25 @@ final class OpenApiParserModelTest
         assertTrue(model.availableServers().contains("https://docs.example.com/api"));
         assertTrue(model.availableServers().contains("https://cdn.example.com/base"));
         assertTrue(model.availableServers().contains("https://docs.example.com/specs/relative/base"));
+    }
+
+    @Test
+    void operationsAreExpandedPerServerWhenMultipleServersAreAvailable()
+    {
+        OpenApiParserModel model = new OpenApiParserModel();
+
+        OpenAPI openAPI = new OpenAPI()
+                .servers(List.of(
+                        new Server().url("https://api.one.test"),
+                        new Server().url("https://api.two.test")
+                ))
+                .paths(new Paths().addPathItem("/users", new PathItem().get(new Operation().summary("Users"))));
+
+        model.load(openAPI, "https://docs.example.com/openapi.json");
+
+        assertEquals(2, model.operations().size());
+        assertEquals(List.of("https://api.one.test"), model.operations().get(0).servers());
+        assertEquals(List.of("https://api.two.test"), model.operations().get(1).servers());
     }
 
     @Test
@@ -145,6 +202,23 @@ final class OpenApiParserModelTest
 
         OpenApiParserModel.OperationContext context = model.operations().get(0);
         assertEquals(List.of("https://operation.example"), context.servers());
+    }
+
+    @Test
+    void summaryTextIsRepairedWhenMojibakeDetected()
+    {
+        OpenApiParserModel model = new OpenApiParserModel();
+
+        OpenAPI openAPI = new OpenAPI()
+                .servers(List.of(new Server().url("https://api.example")))
+                .paths(new Paths().addPathItem(
+                        "/items",
+                        new PathItem().get(new Operation().summary("РњРµС‚РѕРґ СЃРѕР·РґР°РЅРёСЏ"))
+                ));
+
+        model.load(openAPI, "https://api.example/openapi.json");
+
+        assertEquals("Метод создания", model.operations().get(0).summary());
     }
 
     @Test
@@ -199,6 +273,9 @@ final class OpenApiParserModelTest
         );
 
         OpenApiParserModel.OperationContext context = new OpenApiParserModel.OperationContext(
+                "source:test",
+                "test-source",
+                "https://api.example/openapi.json",
                 "POST",
                 "/users",
                 "Create user",
@@ -227,6 +304,9 @@ final class OpenApiParserModelTest
         );
 
         OpenApiParserModel.OperationContext context = new OpenApiParserModel.OperationContext(
+                "source:test",
+                "test-source",
+                "https://api.example/openapi.json",
                 "POST",
                 "/legacy",
                 "Legacy",
@@ -245,6 +325,9 @@ final class OpenApiParserModelTest
     void preferredServerSelectionWorks()
     {
         OpenApiParserModel.OperationContext context = new OpenApiParserModel.OperationContext(
+                "source:test",
+                "test-source",
+                "https://api.example/openapi.json",
                 "GET",
                 "/users",
                 "Users",
@@ -259,6 +342,9 @@ final class OpenApiParserModelTest
         assertEquals("https://selected-server", context.preferredServer(List.of("https://global"), "https://selected-server"));
         assertEquals("https://operation-server", context.preferredServer(List.of("https://global"), "(Operation default)"));
         assertEquals("https://global", new OpenApiParserModel.OperationContext(
+                "source:test",
+                "test-source",
+                "https://api.example/openapi.json",
                 "GET", "/users", "Users", "users", List.of(), List.of(), List.of(), null, new Operation()
         ).preferredServer(List.of("https://global"), "(Operation default)"));
     }

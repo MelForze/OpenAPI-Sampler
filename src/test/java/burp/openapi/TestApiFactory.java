@@ -6,6 +6,8 @@ import burp.api.montoya.extension.Extension;
 import burp.api.montoya.http.Http;
 import burp.api.montoya.intruder.Intruder;
 import burp.api.montoya.logging.Logging;
+import burp.api.montoya.persistence.Persistence;
+import burp.api.montoya.persistence.PersistedObject;
 import burp.api.montoya.repeater.Repeater;
 import burp.api.montoya.scanner.Scanner;
 import burp.api.montoya.scope.Scope;
@@ -15,9 +17,12 @@ import burp.api.montoya.ui.editor.EditorOptions;
 import burp.api.montoya.ui.editor.HttpRequestEditor;
 
 import javax.swing.JPanel;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -40,8 +45,11 @@ final class TestApiFactory
         Http http = mock(Http.class);
         SiteMap siteMap = mock(SiteMap.class);
         Scanner scanner = mock(Scanner.class);
+        Persistence persistence = mock(Persistence.class);
+        PersistedObject extensionData = mock(PersistedObject.class);
 
         Registration registration = mock(Registration.class);
+        Map<String, String> persistedStrings = new ConcurrentHashMap<>();
 
         when(api.extension()).thenReturn(extension);
         when(api.userInterface()).thenReturn(userInterface);
@@ -52,11 +60,24 @@ final class TestApiFactory
         when(api.http()).thenReturn(http);
         when(api.siteMap()).thenReturn(siteMap);
         when(api.scanner()).thenReturn(scanner);
+        when(api.persistence()).thenReturn(persistence);
+        when(persistence.extensionData()).thenReturn(extensionData);
 
         when(userInterface.createHttpRequestEditor(any(EditorOptions[].class))).thenReturn(requestEditor);
         when(userInterface.registerSuiteTab(anyString(), any())).thenReturn(registration);
         when(userInterface.registerContextMenuItemsProvider(any())).thenReturn(registration);
         when(requestEditor.uiComponent()).thenReturn(new JPanel());
+
+        when(extensionData.getString(anyString())).thenAnswer(invocation -> persistedStrings.get(invocation.getArgument(0)));
+        doAnswer(invocation -> {
+            String key = invocation.getArgument(0);
+            String value = invocation.getArgument(1);
+            if (key != null)
+            {
+                persistedStrings.put(key, value);
+            }
+            return null;
+        }).when(extensionData).setString(anyString(), anyString());
 
         return new ApiContext(
                 api,
@@ -69,7 +90,9 @@ final class TestApiFactory
                 scope,
                 http,
                 siteMap,
-                scanner
+                scanner,
+                persistence,
+                extensionData
         );
     }
 
@@ -86,6 +109,8 @@ final class TestApiFactory
         final Http http;
         final SiteMap siteMap;
         final Scanner scanner;
+        final Persistence persistence;
+        final PersistedObject extensionData;
 
         private ApiContext(
                 MontoyaApi api,
@@ -98,7 +123,9 @@ final class TestApiFactory
                 Scope scope,
                 Http http,
                 SiteMap siteMap,
-                Scanner scanner)
+                Scanner scanner,
+                Persistence persistence,
+                PersistedObject extensionData)
         {
             this.api = api;
             this.extension = extension;
@@ -111,6 +138,8 @@ final class TestApiFactory
             this.http = http;
             this.siteMap = siteMap;
             this.scanner = scanner;
+            this.persistence = persistence;
+            this.extensionData = extensionData;
         }
     }
 }

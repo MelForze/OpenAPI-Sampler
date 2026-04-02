@@ -27,9 +27,9 @@ final class OpenApiParserExtensionTest
 
         extension.initialize(ctx.api);
 
-        verify(ctx.extension).setName("OpenAPI Parser v2.0.9");
+        verify(ctx.extension).setName("OpenAPI Parser v2.0.12");
         verify(ctx.userInterface).registerSuiteTab(eq("OpenAPI Parser"), any(Component.class));
         verify(ctx.userInterface).registerContextMenuItemsProvider(any(ContextMenuItemsProvider.class));
-        verify(ctx.logging).logToOutput(contains("[OpenAPI Parser] Loaded. Version=2.0.9, Author=MelForze"));
+        verify(ctx.logging).logToOutput(contains("[OpenAPI Parser] Loaded. Version=2.0.12, Author=MelForze"));
     }
 }

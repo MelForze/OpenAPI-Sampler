@@ -32,6 +32,8 @@ public final class OpenApiParserModel
     private String sourceLocation;
     private final List<OperationContext> operations = new ArrayList<>();
     private final List<String> availableServers = new ArrayList<>();
+    private final LinkedHashMap<String, SourceContext> sources = new LinkedHashMap<>();
+    private final LinkedHashMap<String, LinkedHashSet<String>> serversBySource = new LinkedHashMap<>();
 
     public OpenAPI openAPI()
     {
@@ -53,6 +55,26 @@ public final class OpenApiParserModel
         return Collections.unmodifiableList(availableServers);
     }
 
+    public List<String> availableServers(String selectedSourceId)
+    {
+        if (Utils.isBlank(selectedSourceId))
+        {
+            return availableServers();
+        }
+
+        LinkedHashSet<String> scoped = serversBySource.get(selectedSourceId);
+        if (scoped == null || scoped.isEmpty())
+        {
+            return List.of();
+        }
+        return List.copyOf(scoped);
+    }
+
+    public List<SourceContext> availableSources()
+    {
+        return List.copyOf(sources.values());
+    }
+
     public int removeOperations(Collection<OperationContext> toRemove)
     {
         if (toRemove == null || toRemove.isEmpty())
@@ -62,6 +84,7 @@ public final class OpenApiParserModel
 
         int before = operations.size();
         operations.removeIf(toRemove::contains);
+        recalculateIndexes();
         return before - operations.size();
     }
 
@@ -71,14 +94,26 @@ public final class OpenApiParserModel
         sourceLocation = null;
         operations.clear();
         availableServers.clear();
+        sources.clear();
+        serversBySource.clear();
     }
 
     public void load(OpenAPI parsedOpenApi, String source)
+    {
+        load(parsedOpenApi, source, source);
+    }
+
+    public void load(OpenAPI parsedOpenApi, String source, String sourceLabel)
     {
         Objects.requireNonNull(parsedOpenApi, "parsedOpenApi must not be null");
 
         this.openAPI = parsedOpenApi;
         this.sourceLocation = source;
+        String normalizedSourceLabel = Utils.coalesce(sourceLabel, source, "unknown source");
+        String sourceId = sourceId(source, normalizedSourceLabel);
+        SourceContext sourceContext = new SourceContext(sourceId, normalizedSourceLabel, source);
+        sources.putIfAbsent(sourceId, sourceContext);
+        serversBySource.computeIfAbsent(sourceId, ignored -> new LinkedHashSet<>());
 
         final Set<String> existingOperationKeys = new LinkedHashSet<>();
         for (OperationContext existing : operations)
@@ -87,10 +122,11 @@ public final class OpenApiParserModel
             {
                 continue;
             }
-            existingOperationKeys.add(operationKey(existing));
+            if (sourceId.equals(existing.sourceId()))
+            {
+                existingOperationKeys.add(operationKey(existing));
+            }
         }
-
-        final Set<String> existingServers = new LinkedHashSet<>(availableServers);
 
         final String sourceDefaultServer = defaultServerFromSource(source);
         final LinkedHashSet<String> globalServers = collectResolvedServers(parsedOpenApi.getServers(), source);
@@ -98,13 +134,15 @@ public final class OpenApiParserModel
         {
             globalServers.add(sourceDefaultServer);
         }
+        LinkedHashSet<String> sourceServers = serversBySource.computeIfAbsent(sourceId, ignored -> new LinkedHashSet<>());
         for (String server : globalServers)
         {
-            if (Utils.nonBlank(server) && existingServers.add(server))
+            if (Utils.nonBlank(server))
             {
-                availableServers.add(server);
+                sourceServers.add(server);
             }
         }
+        recalculateAvailableServers();
 
         if (parsedOpenApi.getPaths() == null || parsedOpenApi.getPaths().isEmpty())
         {
@@ -147,29 +185,43 @@ public final class OpenApiParserModel
                     operationServers.add(sourceDefaultServer);
                 }
 
-                final String summary = Utils.coalesce(operation.getSummary(), operation.getDescription(), operation.getOperationId(), "-");
-                final String operationId = Utils.coalesce(operation.getOperationId(), "-");
+                final String summary = Utils.repairMojibake(
+                        Utils.coalesce(operation.getSummary(), operation.getDescription(), operation.getOperationId(), "-")
+                );
+                final String operationId = Utils.repairMojibake(Utils.coalesce(operation.getOperationId(), "-"));
                 final List<String> tags = operation.getTags() == null ? List.of() : List.copyOf(operation.getTags());
 
-                OperationContext operationContext = new OperationContext(
-                        httpMethod.name().toUpperCase(),
-                        path,
-                        summary,
-                        operationId,
-                        tags,
-                        List.copyOf(operationServers),
-                        mergedParameters,
-                        operation.getRequestBody(),
-                        operation
-                );
-
-                String key = operationKey(operationContext);
-                if (!existingOperationKeys.add(key))
+                List<String> rowServers = operationServers.stream().filter(Utils::nonBlank).toList();
+                if (rowServers.isEmpty())
                 {
-                    continue;
+                    rowServers = List.of(sourceDefaultServer);
                 }
 
-                operations.add(operationContext);
+                for (String rowServer : rowServers)
+                {
+                    OperationContext operationContext = new OperationContext(
+                            sourceId,
+                            normalizedSourceLabel,
+                            source,
+                            httpMethod.name().toUpperCase(),
+                            path,
+                            summary,
+                            operationId,
+                            tags,
+                            List.of(rowServer),
+                            mergedParameters,
+                            operation.getRequestBody(),
+                            operation
+                    );
+
+                    String key = operationKey(operationContext);
+                    if (!existingOperationKeys.add(key))
+                    {
+                        continue;
+                    }
+
+                    operations.add(operationContext);
+                }
             }
         }
 
@@ -179,8 +231,15 @@ public final class OpenApiParserModel
             {
                 return byPath;
             }
-            return a.method().compareToIgnoreCase(b.method());
+            int byMethod = a.method().compareToIgnoreCase(b.method());
+            if (byMethod != 0)
+            {
+                return byMethod;
+            }
+            return a.serversAsString().compareToIgnoreCase(b.serversAsString());
         });
+
+        recalculateIndexes();
     }
 
     private String operationKey(OperationContext operationContext)
@@ -199,15 +258,21 @@ public final class OpenApiParserModel
 
     public List<OperationContext> filter(String query)
     {
-        return filter(query, null);
+        return filter(query, null, null);
     }
 
     public List<OperationContext> filter(String query, String selectedServer)
     {
+        return filter(query, selectedServer, null);
+    }
+
+    public List<OperationContext> filter(String query, String selectedServer, String selectedSourceId)
+    {
         final String normalized = Utils.safeLower(query).trim();
         final boolean filterByServer = Utils.nonBlank(selectedServer) && !"(Operation default)".equals(selectedServer);
+        final boolean filterBySource = Utils.nonBlank(selectedSourceId);
 
-        if (normalized.isEmpty() && !filterByServer)
+        if (normalized.isEmpty() && !filterByServer && !filterBySource)
         {
             return List.copyOf(operations);
         }
@@ -215,6 +280,10 @@ public final class OpenApiParserModel
         final List<OperationContext> filtered = new ArrayList<>();
         for (OperationContext operation : operations)
         {
+            if (filterBySource && !selectedSourceId.equals(operation.sourceId()))
+            {
+                continue;
+            }
             if (filterByServer && !operation.servers().contains(selectedServer))
             {
                 continue;
@@ -432,7 +501,89 @@ public final class OpenApiParserModel
         return "http://localhost";
     }
 
+    private String sourceId(String sourceLocation, String sourceLabel)
+    {
+        String preferred = Utils.coalesce(sourceLocation);
+        if (Utils.nonBlank(preferred))
+        {
+            return preferred;
+        }
+        return "source:" + Utils.coalesce(sourceLabel, "unknown");
+    }
+
+    private void recalculateIndexes()
+    {
+        LinkedHashMap<String, SourceContext> recalculatedSources = new LinkedHashMap<>();
+        LinkedHashMap<String, LinkedHashSet<String>> recalculatedServersBySource = new LinkedHashMap<>();
+
+        for (SourceContext knownSource : sources.values())
+        {
+            if (knownSource == null || Utils.isBlank(knownSource.id()))
+            {
+                continue;
+            }
+            recalculatedSources.put(knownSource.id(), knownSource);
+            recalculatedServersBySource.put(knownSource.id(), new LinkedHashSet<>());
+        }
+
+        for (OperationContext operation : operations)
+        {
+            if (operation == null || Utils.isBlank(operation.sourceId()))
+            {
+                continue;
+            }
+
+            recalculatedSources.putIfAbsent(
+                    operation.sourceId(),
+                    new SourceContext(
+                            operation.sourceId(),
+                            Utils.coalesce(operation.sourceLabel(), operation.sourceId()),
+                            operation.sourceLocation()
+                    )
+            );
+            LinkedHashSet<String> sourceServers = recalculatedServersBySource.computeIfAbsent(
+                    operation.sourceId(),
+                    ignored -> new LinkedHashSet<>()
+            );
+            if (operation.servers() != null)
+            {
+                sourceServers.addAll(operation.servers().stream().filter(Utils::nonBlank).toList());
+            }
+        }
+
+        // Keep source insertion order stable while removing sources that no longer have operations.
+        recalculatedSources.entrySet().removeIf(entry ->
+                operations.stream().noneMatch(operation -> operation != null && entry.getKey().equals(operation.sourceId())));
+        recalculatedServersBySource.entrySet().removeIf(entry ->
+                !recalculatedSources.containsKey(entry.getKey()));
+
+        sources.clear();
+        sources.putAll(recalculatedSources);
+        serversBySource.clear();
+        serversBySource.putAll(recalculatedServersBySource);
+        recalculateAvailableServers();
+    }
+
+    private void recalculateAvailableServers()
+    {
+        LinkedHashSet<String> union = new LinkedHashSet<>();
+        for (LinkedHashSet<String> sourceServers : serversBySource.values())
+        {
+            if (sourceServers == null || sourceServers.isEmpty())
+            {
+                continue;
+            }
+            union.addAll(sourceServers.stream().filter(Utils::nonBlank).toList());
+        }
+
+        availableServers.clear();
+        availableServers.addAll(union);
+    }
+
     public record OperationContext(
+            String sourceId,
+            String sourceLabel,
+            String sourceLocation,
             String method,
             String path,
             String summary,
@@ -555,6 +706,15 @@ public final class OpenApiParserModel
                 return null;
             }
             return requestBody.getContent().values().iterator().next().getSchema();
+        }
+    }
+
+    public record SourceContext(String id, String label, String location)
+    {
+        @Override
+        public String toString()
+        {
+            return Utils.coalesce(label, id);
         }
     }
 }

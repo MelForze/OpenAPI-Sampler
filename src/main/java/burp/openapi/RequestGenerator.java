@@ -8,6 +8,7 @@ import io.swagger.v3.oas.models.examples.Example;
 import io.swagger.v3.oas.models.media.ArraySchema;
 import io.swagger.v3.oas.models.media.ComposedSchema;
 import io.swagger.v3.oas.models.media.Content;
+import io.swagger.v3.oas.models.media.Discriminator;
 import io.swagger.v3.oas.models.media.MediaType;
 import io.swagger.v3.oas.models.media.Schema;
 import io.swagger.v3.oas.models.parameters.Parameter;
@@ -33,6 +34,7 @@ import java.util.Set;
 public final class RequestGenerator
 {
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+    private static final int MAX_ARRAY_EXAMPLES = 3;
 
     public HttpRequest generate(
             OpenApiParserModel.OperationContext operationContext,
@@ -371,38 +373,28 @@ public final class RequestGenerator
 
         if (schema instanceof ComposedSchema composedSchema)
         {
-            if (composedSchema.getAllOf() != null && !composedSchema.getAllOf().isEmpty())
+            Object composed = buildComposedSchemaExample(composedSchema, visitedRefs);
+            if (composed != null)
             {
-                Map<String, Object> merged = new LinkedHashMap<>();
-                for (Schema<?> child : composedSchema.getAllOf())
-                {
-                    Object part = buildExampleFromSchema(child, visitedRefs);
-                    if (part instanceof Map<?, ?> map)
-                    {
-                        for (Map.Entry<?, ?> entry : map.entrySet())
-                        {
-                            merged.put(String.valueOf(entry.getKey()), entry.getValue());
-                        }
-                    }
-                }
-                return merged;
-            }
-
-            if (composedSchema.getOneOf() != null && !composedSchema.getOneOf().isEmpty())
-            {
-                return buildExampleFromSchema(composedSchema.getOneOf().get(0), visitedRefs);
-            }
-
-            if (composedSchema.getAnyOf() != null && !composedSchema.getAnyOf().isEmpty())
-            {
-                return buildExampleFromSchema(composedSchema.getAnyOf().get(0), visitedRefs);
+                return composed;
             }
         }
 
         if (schema instanceof ArraySchema arraySchema)
         {
             Schema<?> items = arraySchema.getItems();
-            return List.of(buildExampleFromSchema(items, visitedRefs));
+            int count = 1;
+            if (arraySchema.getMinItems() != null && arraySchema.getMinItems() > 0)
+            {
+                count = Math.min(arraySchema.getMinItems(), MAX_ARRAY_EXAMPLES);
+            }
+
+            List<Object> sampleItems = new ArrayList<>();
+            for (int i = 0; i < count; i++)
+            {
+                sampleItems.add(buildExampleFromSchema(items, visitedRefs));
+            }
+            return sampleItems;
         }
 
         if (schema.getProperties() != null && !schema.getProperties().isEmpty())
@@ -435,6 +427,244 @@ public final class RequestGenerator
                 yield "sample";
             }
         };
+    }
+
+    private Object buildComposedSchemaExample(ComposedSchema composedSchema, Set<String> visitedRefs)
+    {
+        if (composedSchema == null)
+        {
+            return null;
+        }
+
+        if (composedSchema.getAllOf() != null && !composedSchema.getAllOf().isEmpty())
+        {
+            Map<String, Object> merged = new LinkedHashMap<>();
+            Object fallback = null;
+
+            for (Schema<?> child : composedSchema.getAllOf())
+            {
+                Object part = buildExampleFromSchema(child, visitedRefs);
+                if (part instanceof Map<?, ?> map)
+                {
+                    deepMerge(merged, map);
+                }
+                else if (fallback == null && part != null)
+                {
+                    fallback = part;
+                }
+            }
+
+            if (!merged.isEmpty())
+            {
+                addDiscriminatorIfMissing(composedSchema, preferredBranch(composedSchema.getAllOf()), merged, visitedRefs);
+                return merged;
+            }
+            return fallback == null ? Collections.emptyMap() : fallback;
+        }
+
+        List<? extends Schema> oneOf = composedSchema.getOneOf();
+        if (oneOf != null && !oneOf.isEmpty())
+        {
+            Schema<?> preferred = preferredBranch(oneOf);
+            Object sample = buildExampleFromSchema(preferred, visitedRefs);
+            if (sample instanceof Map<?, ?> map)
+            {
+                Map<String, Object> withDiscriminator = new LinkedHashMap<>();
+                deepMerge(withDiscriminator, map);
+                addDiscriminatorIfMissing(composedSchema, preferred, withDiscriminator, visitedRefs);
+                return withDiscriminator;
+            }
+            return sample;
+        }
+
+        List<? extends Schema> anyOf = composedSchema.getAnyOf();
+        if (anyOf != null && !anyOf.isEmpty())
+        {
+            Schema<?> preferred = preferredBranch(anyOf);
+            Object sample = buildExampleFromSchema(preferred, visitedRefs);
+            if (sample instanceof Map<?, ?> map)
+            {
+                Map<String, Object> withDiscriminator = new LinkedHashMap<>();
+                deepMerge(withDiscriminator, map);
+                addDiscriminatorIfMissing(composedSchema, preferred, withDiscriminator, visitedRefs);
+                return withDiscriminator;
+            }
+            return sample;
+        }
+
+        return null;
+    }
+
+    private Schema<?> preferredBranch(List<? extends Schema> candidates)
+    {
+        if (candidates == null || candidates.isEmpty())
+        {
+            return null;
+        }
+
+        for (Schema<?> candidate : candidates)
+        {
+            if (hasPrioritySample(candidate, new LinkedHashSet<>()))
+            {
+                return candidate;
+            }
+        }
+        return candidates.get(0);
+    }
+
+    private boolean hasPrioritySample(Schema<?> schema, Set<String> visitedRefs)
+    {
+        if (schema == null)
+        {
+            return false;
+        }
+        if (schema.get$ref() != null && !visitedRefs.add(schema.get$ref()))
+        {
+            return false;
+        }
+
+        if (schema.getExample() != null || schema.getDefault() != null)
+        {
+            return true;
+        }
+        if (schema.getEnum() != null && !schema.getEnum().isEmpty())
+        {
+            return true;
+        }
+
+        if (schema instanceof ComposedSchema composedSchema)
+        {
+            if (composedSchema.getAllOf() != null)
+            {
+                for (Schema<?> child : composedSchema.getAllOf())
+                {
+                    if (hasPrioritySample(child, visitedRefs))
+                    {
+                        return true;
+                    }
+                }
+            }
+            if (composedSchema.getOneOf() != null)
+            {
+                for (Schema<?> child : composedSchema.getOneOf())
+                {
+                    if (hasPrioritySample(child, visitedRefs))
+                    {
+                        return true;
+                    }
+                }
+            }
+            if (composedSchema.getAnyOf() != null)
+            {
+                for (Schema<?> child : composedSchema.getAnyOf())
+                {
+                    if (hasPrioritySample(child, visitedRefs))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        if (schema.getProperties() != null)
+        {
+            for (Object propertySchema : schema.getProperties().values())
+            {
+                if (propertySchema instanceof Schema<?> child && hasPrioritySample(child, visitedRefs))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private void deepMerge(Map<String, Object> target, Map<?, ?> source)
+    {
+        for (Map.Entry<?, ?> entry : source.entrySet())
+        {
+            String key = String.valueOf(entry.getKey());
+            Object incoming = entry.getValue();
+            Object existing = target.get(key);
+            if (existing instanceof Map<?, ?> existingMap && incoming instanceof Map<?, ?> incomingMap)
+            {
+                Map<String, Object> merged = new LinkedHashMap<>();
+                deepMerge(merged, existingMap);
+                deepMerge(merged, incomingMap);
+                target.put(key, merged);
+            }
+            else
+            {
+                target.put(key, incoming);
+            }
+        }
+    }
+
+    private void addDiscriminatorIfMissing(
+            ComposedSchema composedSchema,
+            Schema<?> selectedBranch,
+            Map<String, Object> target,
+            Set<String> visitedRefs)
+    {
+        if (composedSchema == null || target == null)
+        {
+            return;
+        }
+
+        Discriminator discriminator = composedSchema.getDiscriminator();
+        if (discriminator == null || Utils.isBlank(discriminator.getPropertyName()))
+        {
+            return;
+        }
+
+        String propertyName = discriminator.getPropertyName();
+        if (target.containsKey(propertyName))
+        {
+            return;
+        }
+
+        String value = resolveDiscriminatorValue(discriminator, selectedBranch, visitedRefs);
+        target.put(propertyName, value);
+    }
+
+    private String resolveDiscriminatorValue(
+            Discriminator discriminator,
+            Schema<?> selectedBranch,
+            Set<String> visitedRefs)
+    {
+        if (discriminator == null)
+        {
+            return "sample";
+        }
+
+        if (discriminator.getMapping() != null && !discriminator.getMapping().isEmpty())
+        {
+            return discriminator.getMapping().keySet().iterator().next();
+        }
+
+        if (selectedBranch != null && Utils.nonBlank(selectedBranch.get$ref()))
+        {
+            String ref = selectedBranch.get$ref();
+            int idx = ref.lastIndexOf('/');
+            return idx >= 0 && idx + 1 < ref.length() ? ref.substring(idx + 1) : ref;
+        }
+
+        if (selectedBranch != null && selectedBranch.getProperties() != null)
+        {
+            Object propertySchema = selectedBranch.getProperties().get(discriminator.getPropertyName());
+            if (propertySchema instanceof Schema<?> discriminatorSchema)
+            {
+                Object value = buildExampleFromSchema(discriminatorSchema, visitedRefs);
+                String normalized = normalizeExampleToString(value);
+                if (Utils.nonBlank(normalized))
+                {
+                    return normalized;
+                }
+            }
+        }
+
+        return "sample-" + discriminator.getPropertyName();
     }
 
     private String toJson(Object value)

@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -28,6 +29,61 @@ final class OpenApiParserTableTest
 
         assertEquals(2, table.visibleOperations().size());
         assertEquals("/users", table.visibleOperations().get(0).path());
+    }
+
+    @Test
+    void methodAndServerAreFirstColumns() throws Exception
+    {
+        OpenApiParserTable parserTable = new OpenApiParserTable();
+        JTable jTable = tableOf(parserTable);
+
+        assertEquals("Method", jTable.getColumnName(0));
+        assertEquals("Server", jTable.getColumnName(1));
+        assertEquals("Path", jTable.getColumnName(2));
+    }
+
+    @Test
+    void canHideAndShowColumn() throws Exception
+    {
+        OpenApiParserTable parserTable = new OpenApiParserTable();
+        JTable jTable = tableOf(parserTable);
+        int initialColumns = jTable.getColumnModel().getColumnCount();
+
+        Method setColumnVisible = OpenApiParserTable.class.getDeclaredMethod("setColumnVisible", int.class, boolean.class);
+        setColumnVisible.setAccessible(true);
+
+        onEdt(() -> invokeSetColumnVisible(setColumnVisible, parserTable, 3, false));
+        assertEquals(initialColumns - 1, jTable.getColumnModel().getColumnCount());
+        assertEquals(-1, jTable.convertColumnIndexToView(3));
+
+        onEdt(() -> invokeSetColumnVisible(setColumnVisible, parserTable, 3, true));
+        assertEquals(initialColumns, jTable.getColumnModel().getColumnCount());
+        assertTrue(jTable.convertColumnIndexToView(3) >= 0);
+    }
+
+    @Test
+    void cannotHideLastVisibleColumn() throws Exception
+    {
+        OpenApiParserTable parserTable = new OpenApiParserTable();
+        JTable jTable = tableOf(parserTable);
+        Method setColumnVisible = OpenApiParserTable.class.getDeclaredMethod("setColumnVisible", int.class, boolean.class);
+        setColumnVisible.setAccessible(true);
+
+        int totalColumns = jTable.getModel().getColumnCount();
+        onEdt(() -> {
+            for (int modelIndex = 1; modelIndex < totalColumns; modelIndex++)
+            {
+                invokeSetColumnVisible(setColumnVisible, parserTable, modelIndex, false);
+            }
+        });
+
+        assertEquals(1, jTable.getColumnModel().getColumnCount());
+        assertTrue(jTable.convertColumnIndexToView(0) >= 0);
+        assertFalse(jTable.convertColumnIndexToView(1) >= 0);
+
+        onEdt(() -> invokeSetColumnVisible(setColumnVisible, parserTable, 0, false));
+        assertEquals(1, jTable.getColumnModel().getColumnCount());
+        assertTrue(jTable.convertColumnIndexToView(0) >= 0);
     }
 
     @Test
@@ -131,7 +187,7 @@ final class OpenApiParserTableTest
     }
 
     @Test
-    void selectAllAndClearSelectionActionsProvideEmptyPayload() throws Exception
+    void selectAllClearSelectionAndVisibleActionsProvideEmptyPayload() throws Exception
     {
         OpenApiParserTable parserTable = new OpenApiParserTable();
         onEdt(() -> parserTable.setOperations(List.of(op("GET", "/a"))));
@@ -148,6 +204,9 @@ final class OpenApiParserTableTest
 
         onEdt(() -> invokeUnchecked(fireSelectionAction, parserTable, OpenApiParserTable.SelectionAction.CLEAR_SELECTION));
         assertEquals(0, payloadSize.get());
+
+        onEdt(() -> invokeUnchecked(fireSelectionAction, parserTable, OpenApiParserTable.SelectionAction.SEND_VISIBLE_TO_REPEATER));
+        assertEquals(0, payloadSize.get());
     }
 
     private JTable tableOf(OpenApiParserTable table) throws Exception
@@ -160,6 +219,9 @@ final class OpenApiParserTableTest
     private OpenApiParserModel.OperationContext op(String method, String path)
     {
         return new OpenApiParserModel.OperationContext(
+                "source:test",
+                "test-source",
+                "https://api.example/openapi.json",
                 method,
                 path,
                 method + " " + path,
@@ -187,6 +249,18 @@ final class OpenApiParserTableTest
         try
         {
             method.invoke(target, arg);
+        }
+        catch (Exception ex)
+        {
+            throw new RuntimeException(ex);
+        }
+    }
+
+    private void invokeSetColumnVisible(Method method, Object target, int modelIndex, boolean visible)
+    {
+        try
+        {
+            method.invoke(target, modelIndex, visible);
         }
         catch (Exception ex)
         {

@@ -1,13 +1,13 @@
 package burp.openapi;
 
 import burp.api.montoya.MontoyaApi;
-import burp.api.montoya.core.Range;
 import burp.api.montoya.core.ToolType;
 import burp.api.montoya.http.RedirectionMode;
 import burp.api.montoya.http.RequestOptions;
 import burp.api.montoya.http.message.HttpRequestResponse;
-import burp.api.montoya.http.message.params.ParsedHttpParameter;
 import burp.api.montoya.http.message.requests.HttpRequest;
+import burp.api.montoya.http.message.responses.HttpResponse;
+import burp.api.montoya.persistence.PersistedObject;
 import burp.api.montoya.scanner.AuditConfiguration;
 import burp.api.montoya.scanner.BuiltInAuditConfiguration;
 import burp.api.montoya.scanner.audit.Audit;
@@ -19,6 +19,7 @@ import io.swagger.v3.oas.models.OpenAPI;
 import io.swagger.v3.parser.OpenAPIV3Parser;
 import io.swagger.v3.parser.core.models.ParseOptions;
 import io.swagger.v3.parser.core.models.SwaggerParseResult;
+import org.mozilla.universalchardet.UniversalDetector;
 
 import javax.swing.BorderFactory;
 import javax.swing.BoxLayout;
@@ -29,6 +30,7 @@ import javax.swing.JLabel;
 import javax.swing.JMenuItem;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
+import javax.swing.JScrollPane;
 import javax.swing.JSplitPane;
 import javax.swing.JTextField;
 import javax.swing.SwingUtilities;
@@ -38,22 +40,38 @@ import javax.swing.filechooser.FileNameExtensionFilter;
 import java.awt.BorderLayout;
 import java.awt.Component;
 import java.awt.FlowLayout;
+import java.io.File;
 import java.io.IOException;
 import java.net.URI;
+import java.net.URLDecoder;
+import java.nio.charset.Charset;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Deque;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Main UI tab and behavior controller.
@@ -63,6 +81,21 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
     private static final String TAB_TITLE = "OpenAPI Parser";
     private static final String EXTENSION_PREFIX = "[OpenAPI Parser] ";
     private static final String DEFAULT_SERVER_ITEM = "(Operation default)";
+    private static final String DEFAULT_SOURCE_ITEM = "(All sources)";
+    private static final int MAX_SPEC_FETCH_ATTEMPTS = 24;
+    private static final int MAX_FETCH_RETRIES = 3;
+    private static final int FETCH_RETRY_BACKOFF_MS = 250;
+    private static final long RESPONSE_TIMEOUT_MS = 25_000L;
+    private static final long PER_ATTEMPT_DEADLINE_MS = 30_000L;
+    private static final int MAX_SPEC_SIZE_BYTES = 5 * 1024 * 1024;
+    private static final String STATE_URL_FIELD = "ui.urlField";
+    private static final String STATE_FILTER_FIELD = "ui.filterField";
+    private static final String STATE_SERVER = "ui.server";
+    private static final String STATE_SOURCE = "ui.source";
+    private static final Pattern URL_FIELD_PATTERN = Pattern.compile(
+            "(?i)(?:\\burl\\b|\\bconfigUrl\\b|[\"']url[\"']|[\"']configUrl[\"'])\\s*[:=]\\s*[\"']([^\"']+)[\"']");
+    private static final Pattern CHARSET_PATTERN = Pattern.compile("(?i)charset\\s*=\\s*([a-z0-9._-]+)");
+    private static final Pattern CP1251_MOJIBAKE_PATTERN = Pattern.compile("(?:Р[\\u0400-\\u04FF]|С[\\u0400-\\u04FF]){3,}");
 
     private final MontoyaApi api;
     private final JPanel rootPanel;
@@ -70,31 +103,46 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
     private final OpenApiParserTable table;
     private final RequestGenerator requestGenerator;
     private final ExecutorService workerPool;
+    private final SpecFetcher specFetcher;
 
     private final JButton loadFileButton;
+    private final JButton loadUrlListButton;
     private final JButton fetchButton;
-    private final JButton generateAllButton;
-    private final JButton deleteSelectedButton;
-    private final JButton repeaterSelectedButton;
-    private final JButton intruderSelectedButton;
+    private final JButton cancelLoadButton;
+    private final JButton copyFailedButton;
+    private final JButton clearFailedButton;
     private final JTextField urlField;
     private final JTextField filterField;
+    private final JComboBox<SourceSelection> sourceSelector;
     private final JComboBox<String> serverSelector;
     private final JLabel statusLabel;
-    private final JLabel scannerStatusLabel;
+    private final JLabel progressLabel;
     private final JLabel requestPreviewLabel;
     private final HttpRequestEditor requestPreviewEditor;
+    private final JLabel failedSummaryLabel;
     private final Set<String> autoIncludedHosts = ConcurrentHashMap.newKeySet();
+    private final List<String> lastLoadFailures = new CopyOnWriteArrayList<>();
+    private final Object auditLock = new Object();
 
     private volatile boolean loadingInProgress;
-    private volatile OpenApiParserModel.OperationContext previewOperationContext;
+    private volatile boolean cancelRequested;
+    private volatile Audit activeAuditTask;
+    private volatile Audit passiveAuditTask;
+    private String restoredSourceId = "";
+    private String restoredServer = "";
 
     public OpenApiParserTab(MontoyaApi api)
+    {
+        this(api, null);
+    }
+
+    OpenApiParserTab(MontoyaApi api, SpecFetcher specFetcher)
     {
         this.api = Objects.requireNonNull(api, "api must not be null");
         this.model = new OpenApiParserModel();
         this.table = new OpenApiParserTable();
         this.requestGenerator = new RequestGenerator();
+        this.specFetcher = specFetcher != null ? specFetcher : this::fetchViaMontoya;
         this.workerPool = Executors.newFixedThreadPool(2, runnable -> {
             Thread worker = new Thread(runnable, "openapi-parser-worker");
             worker.setDaemon(true);
@@ -105,52 +153,51 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         this.rootPanel.setBorder(BorderFactory.createEmptyBorder(8, 8, 8, 8));
 
         this.loadFileButton = new JButton("Load from file");
+        this.loadUrlListButton = new JButton("Load URL list");
         this.urlField = new JTextField(48);
         this.fetchButton = new JButton("Fetch");
+        this.cancelLoadButton = new JButton("Cancel load");
+        this.cancelLoadButton.setEnabled(false);
 
+        this.sourceSelector = new JComboBox<>();
+        this.sourceSelector.addItem(SourceSelection.allSources());
         this.serverSelector = new JComboBox<>();
         this.serverSelector.addItem(DEFAULT_SERVER_ITEM);
 
         this.filterField = new JTextField(32);
-        this.generateAllButton = new JButton("Generate all requests");
-        this.deleteSelectedButton = new JButton("Delete selected");
-        this.repeaterSelectedButton = new JButton("Selected -> Repeater");
-        this.intruderSelectedButton = new JButton("Selected -> Intruder");
 
         this.statusLabel = new JLabel("Load an OpenAPI specification to begin.");
-        this.scannerStatusLabel = new JLabel("Scanner tasks: idle");
+        this.progressLabel = new JLabel("Progress: idle");
         this.requestPreviewLabel = new JLabel("Request preview: select an operation.");
         this.requestPreviewEditor = api.userInterface().createHttpRequestEditor(EditorOptions.READ_ONLY);
         this.requestPreviewEditor.setRequest(previewPlaceholderRequest());
+        this.failedSummaryLabel = new JLabel("Load errors: none.");
+        this.copyFailedButton = new JButton("Copy failed URLs");
+        this.copyFailedButton.setEnabled(false);
+        this.clearFailedButton = new JButton("Clear errors");
+        this.clearFailedButton.setEnabled(false);
 
         JPanel controls = new JPanel();
         controls.setLayout(new BoxLayout(controls, BoxLayout.Y_AXIS));
 
         JPanel loadRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 4));
         loadRow.add(loadFileButton);
+        loadRow.add(loadUrlListButton);
         loadRow.add(new JLabel("Load from URL:"));
         loadRow.add(urlField);
         loadRow.add(fetchButton);
+        loadRow.add(cancelLoadButton);
 
         JPanel optionsRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 4));
+        optionsRow.add(new JLabel("Source:"));
+        optionsRow.add(sourceSelector);
         optionsRow.add(new JLabel("Server:"));
         optionsRow.add(serverSelector);
         optionsRow.add(new JLabel("Filter:"));
         optionsRow.add(filterField);
-        optionsRow.add(generateAllButton);
-
-        JPanel bulkRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 4));
-        bulkRow.add(deleteSelectedButton);
-        bulkRow.add(repeaterSelectedButton);
-        bulkRow.add(intruderSelectedButton);
 
         controls.add(loadRow);
         controls.add(optionsRow);
-        controls.add(bulkRow);
-
-        JPanel statusPanel = new JPanel();
-        statusPanel.setLayout(new BoxLayout(statusPanel, BoxLayout.Y_AXIS));
-        statusPanel.add(statusLabel);
 
         JPanel previewPanel = new JPanel(new BorderLayout(6, 6));
         previewPanel.setBorder(BorderFactory.createEmptyBorder(4, 0, 0, 0));
@@ -163,19 +210,26 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
 
         this.rootPanel.add(controls, BorderLayout.NORTH);
         this.rootPanel.add(splitPane, BorderLayout.CENTER);
-        this.rootPanel.add(statusPanel, BorderLayout.SOUTH);
 
         table.setRowActionListener(this::onRowAction);
         table.setSelectionActionListener(this::onSelectionAction);
         table.setSelectionChangedListener(this::onTableSelectionChanged);
 
         loadFileButton.addActionListener(e -> onLoadFromFile());
+        loadUrlListButton.addActionListener(e -> onLoadFromUrlListFile());
         fetchButton.addActionListener(e -> fetchAndLoadFromUrl(urlField.getText()));
-        generateAllButton.addActionListener(e -> onGenerateAllRequests());
-        deleteSelectedButton.addActionListener(e -> onDeleteSelected());
-        repeaterSelectedButton.addActionListener(e -> onSendSelectedToRepeater());
-        intruderSelectedButton.addActionListener(e -> onSendSelectedToIntruder());
-        serverSelector.addActionListener(e -> applyFilter());
+        cancelLoadButton.addActionListener(e -> requestCancelUrlListLoad());
+        copyFailedButton.addActionListener(e -> copyFailedUrlsToClipboard());
+        clearFailedButton.addActionListener(e -> clearLoadErrors());
+        sourceSelector.addActionListener(e -> {
+            refreshServerSelector();
+            applyFilter();
+            persistUiState();
+        });
+        serverSelector.addActionListener(e -> {
+            applyFilter();
+            persistUiState();
+        });
 
         filterField.getDocument().addDocumentListener(new DocumentListener()
         {
@@ -183,20 +237,46 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
             public void insertUpdate(DocumentEvent e)
             {
                 applyFilter();
+                persistUiState();
             }
 
             @Override
             public void removeUpdate(DocumentEvent e)
             {
                 applyFilter();
+                persistUiState();
             }
 
             @Override
             public void changedUpdate(DocumentEvent e)
             {
                 applyFilter();
+                persistUiState();
             }
         });
+
+        urlField.getDocument().addDocumentListener(new DocumentListener()
+        {
+            @Override
+            public void insertUpdate(DocumentEvent e)
+            {
+                persistUiState();
+            }
+
+            @Override
+            public void removeUpdate(DocumentEvent e)
+            {
+                persistUiState();
+            }
+
+            @Override
+            public void changedUpdate(DocumentEvent e)
+            {
+                persistUiState();
+            }
+        });
+
+        restoreUiState();
     }
 
     public String tabTitle()
@@ -273,7 +353,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         Path path = chooser.getSelectedFile().toPath();
 
         runBackgroundLoad("Parsing OpenAPI file...", () -> {
-            String content = Files.readString(path, StandardCharsets.UTF_8);
+            String content = readSpecFileContent(path);
             return parseSpec(content, path.getFileName().toString(), path.toUri().toString(), true);
         }, "File load");
     }
@@ -287,31 +367,1211 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         }
 
         final String normalizedUrl = url.trim();
-        runBackgroundLoad("Fetching OpenAPI from URL...", () -> {
-            URI.create(normalizedUrl);
+        persistUiState();
+        runBackgroundLoad("Fetching OpenAPI from URL...", () -> fetchAndParseFromUrl(normalizedUrl), "Fetch");
+    }
 
-            HttpRequest specRequest = HttpRequest.httpRequestFromUrl(normalizedUrl)
-                    .withMethod("GET")
-                    .withAddedHeader("Accept", "application/json, application/yaml, text/yaml, */*");
+    private void onLoadFromUrlListFile()
+    {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle("Select file with OpenAPI URLs");
+        chooser.setFileFilter(new FileNameExtensionFilter("URL list files (*.txt, *.list, *.urls, *.csv)", "txt", "list", "urls", "csv"));
 
-            RequestOptions requestOptions = RequestOptions.requestOptions()
-                    .withResponseTimeout(25_000)
-                    .withRedirectionMode(RedirectionMode.ALWAYS);
+        int result = chooser.showOpenDialog(rootPanel);
+        if (result != JFileChooser.APPROVE_OPTION)
+        {
+            return;
+        }
 
-            HttpRequestResponse response = api.http().sendRequest(specRequest, requestOptions);
-            if (!response.hasResponse() || response.response() == null)
+        Path path = chooser.getSelectedFile().toPath();
+        runBackgroundUrlListLoad(path);
+    }
+
+    private void runBackgroundUrlListLoad(Path listPath)
+    {
+        if (loadingInProgress)
+        {
+            statusLabel.setText("OpenAPI loading is already in progress...");
+            return;
+        }
+
+        clearLoadErrors();
+        cancelRequested = false;
+        loadingInProgress = true;
+        progressLabel.setText("Progress: preparing URL list...");
+        setLoadingState(true, "Fetching OpenAPI specs from URL list...");
+
+        CompletableFuture
+                .supplyAsync(() -> {
+                    try
+                    {
+                        return fetchAndParseFromUrlList(listPath);
+                    }
+                    catch (Exception ex)
+                    {
+                        throw new CompletionException(ex);
+                    }
+                }, workerPool)
+                .whenComplete((result, throwable) -> SwingUtilities.invokeLater(() -> {
+                    loadingInProgress = false;
+                    cancelRequested = false;
+                    setLoadingState(false, null);
+
+                    if (throwable != null)
+                    {
+                        Throwable root = unwrap(throwable);
+                        progressLabel.setText("Progress: failed");
+                        registerLoadFailure("URL list", Utils.coalesce(root.getMessage(), root.getClass().getSimpleName()));
+                        logError("URL list load failed: " + root.getMessage(), toException(root));
+                        showError("URL list load error", "Unable to complete operation:\n" + root.getMessage());
+                        return;
+                    }
+
+                    applyBatchParseOutcome(result);
+                }));
+    }
+
+    private BatchLoadResult fetchAndParseFromUrlList(Path listPath) throws Exception
+    {
+        UrlListParseResult parsed = parseUrlList(Files.readAllLines(listPath, StandardCharsets.UTF_8));
+        if (parsed.urls().isEmpty())
+        {
+            throw new IllegalStateException("No valid URLs found in file: " + listPath.getFileName());
+        }
+
+        publishUrlListProgress(0, parsed.urls().size(), "Starting...");
+
+        if (!parsed.normalizationNotes().isEmpty())
+        {
+            for (String note : parsed.normalizationNotes())
             {
-                throw new IOException("No response received from " + normalizedUrl);
+                log(note);
+            }
+        }
+
+        if (!parsed.skipNotes().isEmpty())
+        {
+            int maxPreview = Math.min(8, parsed.skipNotes().size());
+            for (int i = 0; i < maxPreview; i++)
+            {
+                log(parsed.skipNotes().get(i));
+            }
+            if (parsed.skipNotes().size() > maxPreview)
+            {
+                log("URL list skipped lines omitted: +" + (parsed.skipNotes().size() - maxPreview));
+            }
+        }
+
+        List<ParseOutcome> outcomes = new ArrayList<>();
+        List<String> failures = new ArrayList<>();
+        int processed = 0;
+        boolean canceled = false;
+        for (String url : parsed.urls())
+        {
+            if (cancelRequested)
+            {
+                canceled = true;
+                break;
             }
 
-            short statusCode = response.response().statusCode();
-            if (statusCode < 200 || statusCode > 299)
+            publishUrlListProgress(processed, parsed.urls().size(), "Fetching " + url);
+            try
             {
-                throw new IOException("HTTP " + statusCode + " returned from " + normalizedUrl);
+                outcomes.add(fetchAndParseFromUrl(url));
+            }
+            catch (Exception ex)
+            {
+                String failure = url + " -> " + Utils.coalesce(ex.getMessage(), ex.getClass().getSimpleName());
+                failures.add(failure);
+                registerLoadFailure(url, Utils.coalesce(ex.getMessage(), ex.getClass().getSimpleName()));
+            }
+            processed++;
+            publishUrlListProgress(processed, parsed.urls().size(), "Processed " + url);
+        }
+
+        return new BatchLoadResult(
+                outcomes,
+                failures,
+                parsed.totalLines(),
+                parsed.urls().size(),
+                parsed.normalizedCount(),
+                parsed.skipNotes().size(),
+                listPath.getFileName().toString(),
+                processed,
+                canceled
+        );
+    }
+
+    private UrlListParseResult parseUrlList(List<String> lines)
+    {
+        if (lines == null || lines.isEmpty())
+        {
+            return new UrlListParseResult(List.of(), List.of(), List.of(), 0, 0);
+        }
+
+        List<String> normalizationNotes = new ArrayList<>();
+        List<String> skipNotes = new ArrayList<>();
+        LinkedHashSet<String> uniqueUrls = new LinkedHashSet<>();
+        int normalizedCount = 0;
+
+        for (int i = 0; i < lines.size(); i++)
+        {
+            int lineNumber = i + 1;
+            UrlLineDecision decision = parseUrlLine(lines.get(i));
+
+            if (!decision.accepted())
+            {
+                skipNotes.add("URL list line " + lineNumber + " skipped: " + decision.note());
+                continue;
             }
 
-            return parseSpec(response.response().bodyToString(), normalizedUrl, normalizedUrl, true);
-        }, "Fetch");
+            if (decision.normalized())
+            {
+                normalizedCount++;
+                normalizationNotes.add("URL list line " + lineNumber + " normalized: " + decision.note());
+            }
+            uniqueUrls.add(decision.url());
+        }
+
+        return new UrlListParseResult(
+                List.copyOf(uniqueUrls),
+                List.copyOf(normalizationNotes),
+                List.copyOf(skipNotes),
+                lines.size(),
+                normalizedCount
+        );
+    }
+
+    private UrlLineDecision parseUrlLine(String line)
+    {
+        String trimmed = Utils.coalesce(line);
+        if (Utils.isBlank(trimmed))
+        {
+            return UrlLineDecision.skipped("blank");
+        }
+        if (trimmed.startsWith("#"))
+        {
+            return UrlLineDecision.skipped("comment");
+        }
+
+        String direct = normalizeToken(trimmed);
+        if (Utils.looksLikeHttpUrl(direct))
+        {
+            return UrlLineDecision.accepted(direct, false, "direct URL");
+        }
+
+        List<String> tokens = csvTokens(trimmed);
+        if (!tokens.isEmpty())
+        {
+            for (String token : tokens)
+            {
+                String normalized = normalizeToken(token);
+                if (Utils.looksLikeHttpUrl(normalized))
+                {
+                    if (!normalized.equals(direct))
+                    {
+                        return UrlLineDecision.accepted(normalized, true, "extracted URL token from CSV-like line");
+                    }
+                    return UrlLineDecision.accepted(normalized, false, "direct URL");
+                }
+            }
+
+            String firstToken = normalizeToken(tokens.get(0));
+            if (looksLikeBareUrlCandidate(firstToken))
+            {
+                return UrlLineDecision.accepted("https://" + firstToken, true, "added https:// to bare host token");
+            }
+        }
+
+        if (looksLikeBareUrlCandidate(direct))
+        {
+            return UrlLineDecision.accepted("https://" + direct, true, "added https:// to bare host");
+        }
+
+        return UrlLineDecision.skipped("not a supported URL format");
+    }
+
+    private List<String> csvTokens(String line)
+    {
+        if (Utils.isBlank(line))
+        {
+            return List.of();
+        }
+        if (!line.contains(",") && !line.contains(";") && !line.contains("\t"))
+        {
+            return List.of();
+        }
+
+        String[] rawTokens = line.split("[,;\\t]");
+        List<String> tokens = new ArrayList<>();
+        for (String rawToken : rawTokens)
+        {
+            String token = normalizeToken(rawToken);
+            if (Utils.nonBlank(token))
+            {
+                tokens.add(token);
+            }
+        }
+        return tokens;
+    }
+
+    private String normalizeToken(String value)
+    {
+        if (value == null)
+        {
+            return "";
+        }
+
+        String normalized = value.trim();
+        if ((normalized.startsWith("\"") && normalized.endsWith("\""))
+                || (normalized.startsWith("'") && normalized.endsWith("'")))
+        {
+            if (normalized.length() > 1)
+            {
+                normalized = normalized.substring(1, normalized.length() - 1);
+            }
+        }
+
+        int inlineComment = normalized.indexOf(" #");
+        if (inlineComment >= 0)
+        {
+            normalized = normalized.substring(0, inlineComment).trim();
+        }
+
+        if (normalized.contains(" "))
+        {
+            normalized = normalized.split("\\s+")[0];
+        }
+
+        return normalized.trim();
+    }
+
+    private boolean looksLikeBareUrlCandidate(String value)
+    {
+        if (Utils.isBlank(value))
+        {
+            return false;
+        }
+
+        String candidate = normalizeToken(value);
+        if (Utils.isBlank(candidate))
+        {
+            return false;
+        }
+        if (candidate.startsWith("/"))
+        {
+            return false;
+        }
+        if (candidate.startsWith("#"))
+        {
+            return false;
+        }
+        if (candidate.contains("://"))
+        {
+            return false;
+        }
+
+        String authorityPart = candidate.split("/", 2)[0];
+        if (!(authorityPart.contains(".")
+                || authorityPart.contains(":")
+                || authorityPart.equalsIgnoreCase("localhost")
+                || authorityPart.matches("\\d+\\.\\d+\\.\\d+\\.\\d+")
+                || authorityPart.startsWith("[")))
+        {
+            return false;
+        }
+
+        try
+        {
+            URI uri = URI.create("https://" + candidate);
+            return Utils.nonBlank(uri.getHost());
+        }
+        catch (Exception ignored)
+        {
+            return false;
+        }
+    }
+
+    private ParseOutcome fetchAndParseFromUrl(String normalizedUrl) throws Exception
+    {
+        URI.create(normalizedUrl);
+
+        Deque<String> queue = new ArrayDeque<>();
+        LinkedHashSet<String> seen = new LinkedHashSet<>();
+        for (String candidate : buildCandidateSpecUrls(normalizedUrl))
+        {
+            enqueueSpecCandidate(queue, seen, candidate);
+        }
+
+        List<String> attemptErrors = new ArrayList<>();
+        int attempts = 0;
+
+        while (!queue.isEmpty() && attempts < MAX_SPEC_FETCH_ATTEMPTS)
+        {
+            String candidate = queue.removeFirst();
+            attempts++;
+
+            try
+            {
+                HttpFetchResult fetchResult = fetchUrl(candidate);
+                String payload = fetchResult.body();
+
+                try
+                {
+                    ParseOutcome outcome = parseSpec(payload, candidate, candidate, true);
+                    if (!normalizedUrl.equals(candidate))
+                    {
+                        log("Resolved spec URL: " + normalizedUrl + " -> " + candidate);
+                    }
+                    return outcome;
+                }
+                catch (Exception parseEx)
+                {
+                    List<String> discovered = extractReferencedUrls(candidate, payload);
+                    int newlyQueued = 0;
+                    for (String referenced : discovered)
+                    {
+                        if (enqueueSpecCandidate(queue, seen, referenced))
+                        {
+                            newlyQueued++;
+                        }
+                    }
+
+                    if (newlyQueued > 0)
+                    {
+                        log("URL candidate " + candidate + " is not a spec; discovered " + newlyQueued + " additional candidate(s).");
+                        attemptErrors.add(candidate + " -> parse: discovered " + newlyQueued + " additional URL candidate(s)");
+                        continue;
+                    }
+                    attemptErrors.add(candidate + " -> parse: " + conciseError(parseEx));
+                }
+            }
+            catch (Exception fetchEx)
+            {
+                attemptErrors.add(candidate + " -> fetch: " + conciseError(fetchEx));
+            }
+        }
+
+        if (!queue.isEmpty())
+        {
+            attemptErrors.add("Stopped after " + MAX_SPEC_FETCH_ATTEMPTS + " attempts to prevent infinite candidate loops.");
+        }
+
+        StringBuilder message = new StringBuilder("Unable to parse OpenAPI from URL: " + normalizedUrl);
+        if (!attemptErrors.isEmpty())
+        {
+            int preview = Math.min(6, attemptErrors.size());
+            message.append("\nTried endpoints:");
+            for (int i = 0; i < preview; i++)
+            {
+                message.append("\n- ").append(attemptErrors.get(i));
+            }
+            if (attemptErrors.size() > preview)
+            {
+                message.append("\n- ... +").append(attemptErrors.size() - preview).append(" more");
+            }
+        }
+        throw new IllegalStateException(message.toString());
+    }
+
+    private HttpFetchResult fetchUrl(String candidateUrl) throws IOException
+    {
+        IOException lastError = null;
+        for (int attempt = 1; attempt <= MAX_FETCH_RETRIES; attempt++)
+        {
+            if (cancelRequested)
+            {
+                throw new IOException("Canceled by user");
+            }
+
+            try
+            {
+                FetchResponse response = specFetcher.fetch(
+                        candidateUrl,
+                        RESPONSE_TIMEOUT_MS,
+                        PER_ATTEMPT_DEADLINE_MS,
+                        true
+                );
+                if (response == null)
+                {
+                    throw new IOException("network: no response received");
+                }
+
+                long declaredContentLength = response.contentLength();
+                if (declaredContentLength > MAX_SPEC_SIZE_BYTES)
+                {
+                    throw new IOException("size-limit: declared Content-Length " + declaredContentLength
+                            + " exceeds max " + MAX_SPEC_SIZE_BYTES + " bytes");
+                }
+
+                byte[] bodyBytes = response.bodyBytes() == null ? new byte[0] : response.bodyBytes();
+                if (bodyBytes.length > MAX_SPEC_SIZE_BYTES)
+                {
+                    throw new IOException("size-limit: response body " + bodyBytes.length
+                            + " exceeds max " + MAX_SPEC_SIZE_BYTES + " bytes");
+                }
+
+                short statusCode = response.statusCode();
+                if (statusCode >= 200 && statusCode <= 299)
+                {
+                    String decoded = decodeBytesBestEffort(
+                            bodyBytes,
+                            detectCharsetFromContentTypeValue(response.contentType()),
+                            ""
+                    );
+                    return new HttpFetchResult(candidateUrl, statusCode, decoded);
+                }
+
+                if (statusCode >= 500 || statusCode == 429)
+                {
+                    throw new IOException("non-2xx: HTTP " + statusCode + " returned");
+                }
+
+                throw new IOException("non-2xx: HTTP " + statusCode + " returned");
+            }
+            catch (IOException ioEx)
+            {
+                lastError = ioEx;
+                if (attempt >= MAX_FETCH_RETRIES || !isRetryableFetchError(ioEx))
+                {
+                    break;
+                }
+
+                log("Fetch retry " + attempt + "/" + MAX_FETCH_RETRIES + " for " + candidateUrl + ": " + conciseError(ioEx));
+                sleepBackoff(attempt);
+            }
+            catch (Exception ex)
+            {
+                lastError = new IOException(Utils.coalesce(ex.getMessage(), ex.getClass().getSimpleName()), ex);
+                if (attempt >= MAX_FETCH_RETRIES)
+                {
+                    break;
+                }
+                log("Fetch retry " + attempt + "/" + MAX_FETCH_RETRIES + " for " + candidateUrl + ": " + conciseError(lastError));
+                sleepBackoff(attempt);
+            }
+        }
+
+        throw lastError == null ? new IOException("Unknown fetch error") : lastError;
+    }
+
+    private FetchResponse fetchViaMontoya(
+            String candidateUrl,
+            long responseTimeoutMs,
+            long attemptDeadlineMs,
+            boolean followRedirects) throws Exception
+    {
+        RequestOptions requestOptions = RequestOptions.requestOptions()
+                .withResponseTimeout(responseTimeoutMs)
+                .withRedirectionMode(followRedirects ? RedirectionMode.ALWAYS : RedirectionMode.NEVER);
+
+        HttpRequest specRequest = HttpRequest.httpRequestFromUrl(candidateUrl)
+                .withMethod("GET")
+                .withAddedHeader("Accept", "application/json, application/yaml, text/yaml, */*");
+
+        FutureTask<HttpRequestResponse> requestTask = new FutureTask<>(() -> api.http().sendRequest(specRequest, requestOptions));
+        Thread requestThread = new Thread(requestTask, "openapi-parser-fetch");
+        requestThread.setDaemon(true);
+        requestThread.start();
+
+        HttpRequestResponse response;
+        try
+        {
+            response = requestTask.get(attemptDeadlineMs, TimeUnit.MILLISECONDS);
+        }
+        catch (TimeoutException timeoutException)
+        {
+            requestTask.cancel(true);
+            throw new IOException("timeout: attempt deadline exceeded (" + attemptDeadlineMs + " ms)", timeoutException);
+        }
+        catch (InterruptedException interruptedException)
+        {
+            Thread.currentThread().interrupt();
+            throw new IOException("timeout: interrupted while waiting for response", interruptedException);
+        }
+        catch (ExecutionException executionException)
+        {
+            Throwable cause = executionException.getCause();
+            if (cause instanceof Exception ex)
+            {
+                throw ex;
+            }
+            throw new IOException("network: " + executionException.getMessage(), executionException);
+        }
+
+        if (response == null || !response.hasResponse() || response.response() == null)
+        {
+            throw new IOException("network: no response received");
+        }
+
+        HttpResponse httpResponse = response.response();
+        byte[] bodyBytes = httpResponse.body() == null ? new byte[0] : httpResponse.body().getBytes();
+        long contentLength = parseContentLength(httpResponse.headerValue("Content-Length"));
+
+        return new FetchResponse(
+                httpResponse.statusCode(),
+                bodyBytes,
+                Utils.coalesce(httpResponse.headerValue("Content-Type")),
+                contentLength
+        );
+    }
+
+    private long parseContentLength(String rawContentLength)
+    {
+        if (Utils.isBlank(rawContentLength))
+        {
+            return -1L;
+        }
+        try
+        {
+            return Long.parseLong(rawContentLength.trim());
+        }
+        catch (NumberFormatException ignored)
+        {
+            return -1L;
+        }
+    }
+
+    private boolean isRetryableFetchError(IOException ex)
+    {
+        if (ex == null)
+        {
+            return false;
+        }
+
+        String message = Utils.safeLower(Utils.coalesce(ex.getMessage()));
+        if (message.contains("canceled by user"))
+        {
+            return false;
+        }
+
+        return message.contains("timeout")
+                || message.contains("connection")
+                || message.contains("temporarily")
+                || message.contains("reset")
+                || message.contains("refused")
+                || message.contains("http 5")
+                || message.contains("http 429")
+                || message.contains("no response");
+    }
+
+    private void sleepBackoff(int attempt)
+    {
+        try
+        {
+            long delay = (long) FETCH_RETRY_BACKOFF_MS * Math.max(1, attempt);
+            Thread.sleep(delay);
+        }
+        catch (InterruptedException interrupted)
+        {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private String decodeResponseBody(HttpResponse response)
+    {
+        if (response == null)
+        {
+            return "";
+        }
+
+        byte[] bodyBytes = null;
+        try
+        {
+            if (response.body() != null)
+            {
+                bodyBytes = response.body().getBytes();
+            }
+        }
+        catch (Exception ignored)
+        {
+            bodyBytes = null;
+        }
+
+        String bodyToString = "";
+        try
+        {
+            bodyToString = Utils.coalesce(response.bodyToString());
+        }
+        catch (Exception ignored)
+        {
+            bodyToString = "";
+        }
+
+        if (bodyBytes == null)
+        {
+            return bodyToString;
+        }
+
+        return decodeBytesBestEffort(bodyBytes, detectCharsetFromContentType(response), bodyToString);
+    }
+
+    private String readSpecFileContent(Path path) throws IOException
+    {
+        byte[] bytes = Files.readAllBytes(path);
+        return decodeBytesBestEffort(bytes, "", "");
+    }
+
+    private boolean startsWith(byte[] bytes, int... prefix)
+    {
+        if (bytes == null || prefix == null || bytes.length < prefix.length)
+        {
+            return false;
+        }
+        for (int i = 0; i < prefix.length; i++)
+        {
+            if ((bytes[i] & 0xFF) != prefix[i])
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private String decodeBytesBestEffort(byte[] bodyBytes, String charsetFromHeader, String fallback)
+    {
+        if (bodyBytes == null || bodyBytes.length == 0)
+        {
+            return Utils.coalesce(fallback);
+        }
+
+        BomDecode bomDecode = detectBom(bodyBytes);
+        if (bomDecode != null)
+        {
+            return decodeWithCharset(bodyBytes, bomDecode.charsetName(), bomDecode.offset());
+        }
+
+        List<String> candidates = new ArrayList<>();
+        if (Utils.nonBlank(charsetFromHeader))
+        {
+            try
+            {
+                candidates.add(new String(bodyBytes, Charset.forName(charsetFromHeader)));
+            }
+            catch (Exception ignored)
+            {
+                // Ignore invalid charset declarations.
+            }
+        }
+
+        String detectedCharset = detectCharsetFromBytes(bodyBytes);
+        if (Utils.nonBlank(detectedCharset)
+                && !detectedCharset.equalsIgnoreCase(charsetFromHeader))
+        {
+            try
+            {
+                candidates.add(new String(bodyBytes, Charset.forName(detectedCharset)));
+            }
+            catch (Exception ignored)
+            {
+                // Ignore invalid auto-detected charset.
+            }
+        }
+
+        String utf8Strict = decodeUtf8Strict(bodyBytes);
+        if (Utils.nonBlank(utf8Strict))
+        {
+            candidates.add(utf8Strict);
+        }
+        candidates.add(decodeUtf8Lenient(bodyBytes));
+        candidates.add(new String(bodyBytes, Charset.forName("windows-1251")));
+        if (Utils.nonBlank(fallback))
+        {
+            candidates.add(fallback);
+        }
+
+        return bestDecodedCandidate(candidates, fallback);
+    }
+
+    private String detectCharsetFromContentType(HttpResponse response)
+    {
+        try
+        {
+            return detectCharsetFromContentTypeValue(response.headerValue("Content-Type"));
+        }
+        catch (Exception ignored)
+        {
+            return "";
+        }
+    }
+
+    private String detectCharsetFromContentTypeValue(String contentType)
+    {
+        if (Utils.isBlank(contentType))
+        {
+            return "";
+        }
+        Matcher matcher = CHARSET_PATTERN.matcher(contentType);
+        if (matcher.find())
+        {
+            return matcher.group(1);
+        }
+        return "";
+    }
+
+    private String detectCharsetFromBytes(byte[] bytes)
+    {
+        if (bytes == null || bytes.length == 0)
+        {
+            return "";
+        }
+        UniversalDetector detector = new UniversalDetector(null);
+        detector.handleData(bytes, 0, Math.min(bytes.length, 64 * 1024));
+        detector.dataEnd();
+        String detected = Utils.coalesce(detector.getDetectedCharset());
+        detector.reset();
+        return detected;
+    }
+
+    private BomDecode detectBom(byte[] bytes)
+    {
+        if (startsWith(bytes, 0xEF, 0xBB, 0xBF))
+        {
+            return new BomDecode("UTF-8", 3);
+        }
+        if (startsWith(bytes, 0xFF, 0xFE))
+        {
+            return new BomDecode("UTF-16LE", 2);
+        }
+        if (startsWith(bytes, 0xFE, 0xFF))
+        {
+            return new BomDecode("UTF-16BE", 2);
+        }
+        return null;
+    }
+
+    private String decodeWithCharset(byte[] bytes, String charsetName, int offset)
+    {
+        if (bytes == null)
+        {
+            return "";
+        }
+        try
+        {
+            int safeOffset = Math.max(0, Math.min(offset, bytes.length));
+            return new String(bytes, safeOffset, bytes.length - safeOffset, Charset.forName(charsetName));
+        }
+        catch (Exception ignored)
+        {
+            return "";
+        }
+    }
+
+    private String decodeUtf8Strict(byte[] bytes)
+    {
+        try
+        {
+            return StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(java.nio.ByteBuffer.wrap(bytes))
+                    .toString();
+        }
+        catch (Exception ignored)
+        {
+            return "";
+        }
+    }
+
+    private String decodeUtf8Lenient(byte[] bytes)
+    {
+        try
+        {
+            return StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPLACE)
+                    .onUnmappableCharacter(CodingErrorAction.REPLACE)
+                    .decode(java.nio.ByteBuffer.wrap(bytes))
+                    .toString();
+        }
+        catch (Exception ignored)
+        {
+            return new String(bytes, StandardCharsets.UTF_8);
+        }
+    }
+
+    private String bestDecodedCandidate(List<String> candidates, String fallback)
+    {
+        String best = Utils.coalesce(fallback);
+        int bestScore = decodeScore(best);
+        for (int i = 0; i < candidates.size(); i++)
+        {
+            String candidate = candidates.get(i);
+            if (candidate == null)
+            {
+                continue;
+            }
+            int precedenceBonus = Math.max(0, candidates.size() - i);
+            int score = decodeScore(candidate) + precedenceBonus;
+            if (score > bestScore)
+            {
+                best = candidate;
+                bestScore = score;
+            }
+        }
+        return best;
+    }
+
+    private int decodeScore(String value)
+    {
+        if (Utils.isBlank(value))
+        {
+            return Integer.MIN_VALUE / 4;
+        }
+
+        int score = 0;
+        String lower = Utils.safeLower(value);
+
+        for (int i = 0; i < value.length(); i++)
+        {
+            char ch = value.charAt(i);
+            if (ch >= '\u0400' && ch <= '\u04FF')
+            {
+                score += 4;
+            }
+            else if (Character.isLetterOrDigit(ch))
+            {
+                score += 1;
+            }
+            else if (ch == '\uFFFD')
+            {
+                score -= 8;
+            }
+        }
+
+        if (lower.contains("openapi") || lower.contains("\"paths\"") || lower.contains("paths:"))
+        {
+            score += 25;
+        }
+
+        if (value.contains("Ð") || value.contains("Ñ") || value.contains("Ã"))
+        {
+            score -= 12;
+        }
+        if (CP1251_MOJIBAKE_PATTERN.matcher(value).find())
+        {
+            score -= 18;
+        }
+
+        return score;
+    }
+
+    private List<String> buildCandidateSpecUrls(String url)
+    {
+        LinkedHashSet<String> candidates = new LinkedHashSet<>();
+        addCandidate(candidates, url);
+
+        URI uri;
+        try
+        {
+            uri = URI.create(url);
+        }
+        catch (Exception ex)
+        {
+            return List.copyOf(candidates);
+        }
+
+        for (String queryCandidate : extractCandidatesFromQuery(url, uri.getRawQuery()))
+        {
+            addCandidate(candidates, queryCandidate);
+        }
+
+        String origin = uriOrigin(uri);
+        if (Utils.isBlank(origin))
+        {
+            return List.copyOf(candidates);
+        }
+
+        String path = Utils.coalesce(uri.getPath(), "/");
+        String lowerPath = path.toLowerCase(Locale.ROOT);
+
+        String directory = path;
+        int lastSlash = path.lastIndexOf('/');
+        if (lastSlash >= 0)
+        {
+            directory = path.substring(0, lastSlash);
+        }
+
+        if (lowerPath.contains("swagger")
+                || lowerPath.contains("api-docs")
+                || lowerPath.endsWith("index.html"))
+        {
+            for (String endpoint : List.of("/v3/api-docs", "/v2/api-docs", "/swagger.json", "/openapi.json", "/openapi.yaml", "/api-docs"))
+            {
+                addCandidate(candidates, joinOriginPath(origin, endpoint));
+                if (Utils.nonBlank(directory))
+                {
+                    addCandidate(candidates, joinOriginPath(origin, directory + endpoint));
+                }
+            }
+
+            int swaggerIndex = lowerPath.indexOf("/swagger");
+            if (swaggerIndex >= 0)
+            {
+                String beforeSwagger = path.substring(0, swaggerIndex);
+                addCandidate(candidates, joinOriginPath(origin, beforeSwagger + "/v3/api-docs"));
+                addCandidate(candidates, joinOriginPath(origin, beforeSwagger + "/v2/api-docs"));
+                addCandidate(candidates, joinOriginPath(origin, beforeSwagger + "/openapi.json"));
+                addCandidate(candidates, joinOriginPath(origin, beforeSwagger + "/swagger.json"));
+
+                String swaggerRoot = path.substring(0, swaggerIndex + "/swagger".length());
+                addCandidate(candidates, joinOriginPath(origin, swaggerRoot + "/v1/swagger.json"));
+                addCandidate(candidates, joinOriginPath(origin, swaggerRoot + "/v2/swagger.json"));
+            }
+        }
+
+        return List.copyOf(candidates);
+    }
+
+    private List<String> extractCandidatesFromQuery(String baseUrl, String rawQuery)
+    {
+        if (Utils.isBlank(rawQuery))
+        {
+            return List.of();
+        }
+
+        LinkedHashSet<String> candidates = new LinkedHashSet<>();
+        String[] pairs = rawQuery.split("[&;]");
+        for (String pair : pairs)
+        {
+            if (Utils.isBlank(pair))
+            {
+                continue;
+            }
+
+            String[] keyValue = pair.split("=", 2);
+            if (keyValue.length != 2)
+            {
+                continue;
+            }
+
+            String key = urlDecode(keyValue[0]).toLowerCase(Locale.ROOT);
+            if (!"url".equals(key) && !"configurl".equals(key))
+            {
+                continue;
+            }
+
+            String value = urlDecode(keyValue[1]);
+            String resolved = resolveAgainst(baseUrl, value);
+            addCandidate(candidates, resolved);
+        }
+        return List.copyOf(candidates);
+    }
+
+    private List<String> extractReferencedUrls(String baseUrl, String payload)
+    {
+        if (Utils.isBlank(payload))
+        {
+            return List.of();
+        }
+
+        String probe = payload.length() > 350_000 ? payload.substring(0, 350_000) : payload;
+        LinkedHashSet<String> discovered = new LinkedHashSet<>();
+        Matcher matcher = URL_FIELD_PATTERN.matcher(probe);
+        while (matcher.find())
+        {
+            String reference = matcher.group(1);
+            String resolved = resolveAgainst(baseUrl, reference);
+            addCandidate(discovered, resolved);
+        }
+
+        return List.copyOf(discovered);
+    }
+
+    private String resolveAgainst(String baseUrl, String candidate)
+    {
+        String normalized = normalizeToken(candidate);
+        if (Utils.isBlank(normalized))
+        {
+            return "";
+        }
+
+        if (Utils.looksLikeHttpUrl(normalized))
+        {
+            return normalized;
+        }
+
+        try
+        {
+            URI base = URI.create(baseUrl);
+            URI resolved = base.resolve(normalized);
+            if (Utils.nonBlank(resolved.getScheme()) && Utils.nonBlank(resolved.getAuthority()))
+            {
+                return resolved.toString();
+            }
+        }
+        catch (Exception ignored)
+        {
+            return "";
+        }
+
+        return "";
+    }
+
+    private String urlDecode(String value)
+    {
+        if (value == null)
+        {
+            return "";
+        }
+        try
+        {
+            return URLDecoder.decode(value, StandardCharsets.UTF_8);
+        }
+        catch (Exception ignored)
+        {
+            return value;
+        }
+    }
+
+    private String uriOrigin(URI uri)
+    {
+        if (uri == null || Utils.isBlank(uri.getScheme()) || Utils.isBlank(uri.getAuthority()))
+        {
+            return "";
+        }
+        return uri.getScheme() + "://" + uri.getAuthority();
+    }
+
+    private String joinOriginPath(String origin, String path)
+    {
+        if (Utils.isBlank(origin) || Utils.isBlank(path))
+        {
+            return "";
+        }
+        String normalized = path.startsWith("/") ? path : "/" + path;
+        return origin + normalized;
+    }
+
+    private boolean enqueueSpecCandidate(Deque<String> queue, Set<String> seen, String candidate)
+    {
+        String normalized = normalizeToken(candidate);
+        if (!Utils.looksLikeHttpUrl(normalized))
+        {
+            return false;
+        }
+
+        try
+        {
+            URI uri = URI.create(normalized);
+            if (Utils.isBlank(uri.getScheme()) || Utils.isBlank(uri.getAuthority()))
+            {
+                return false;
+            }
+        }
+        catch (Exception ignored)
+        {
+            return false;
+        }
+
+        if (!seen.add(normalized))
+        {
+            return false;
+        }
+
+        queue.addLast(normalized);
+        return true;
+    }
+
+    private void addCandidate(Set<String> candidates, String candidate)
+    {
+        if (candidates == null)
+        {
+            return;
+        }
+
+        String normalized = normalizeToken(candidate);
+        if (!Utils.looksLikeHttpUrl(normalized))
+        {
+            return;
+        }
+        candidates.add(normalized);
+    }
+
+    private String conciseError(Exception ex)
+    {
+        String message = ex == null ? "" : Utils.coalesce(ex.getMessage());
+        if (Utils.isBlank(message))
+        {
+            return ex == null ? "unknown error" : ex.getClass().getSimpleName();
+        }
+
+        String firstLine = message.lines().findFirst().orElse(message);
+        String compact = firstLine.trim();
+        return compact.length() > 180 ? compact.substring(0, 177) + "..." : compact;
+    }
+
+    private void applyBatchParseOutcome(BatchLoadResult result)
+    {
+        int previousCount = model.operations().size();
+        int loadedSpecs = 0;
+
+        replaceLoadFailures(result.failures());
+
+        for (ParseOutcome outcome : result.outcomes())
+        {
+            int before = model.operations().size();
+            model.load(outcome.openAPI(), outcome.sourceLocation(), outcome.sourceLabel());
+            autoIncludeSpecHostInScope(outcome.sourceLocation());
+            loadedSpecs++;
+
+            int added = Math.max(0, model.operations().size() - before);
+            log("Loaded from " + outcome.sourceLabel() + ": +" + added + " operation(s)");
+
+            if (outcome.parseResult().getMessages() != null && !outcome.parseResult().getMessages().isEmpty())
+            {
+                for (String warning : outcome.parseResult().getMessages())
+                {
+                    log("Parser warning: " + warning);
+                }
+            }
+        }
+
+        refreshSourceSelector();
+        refreshServerSelector();
+        applyFilter();
+
+        int totalCount = model.operations().size();
+        int addedCount = Math.max(0, totalCount - previousCount);
+        int failed = result.failures().size();
+        String canceledSuffix = result.canceled() ? ", canceled" : "";
+
+        statusLabel.setText("URL list loaded (" + result.sourceLabel() + "): lines=" + result.totalLines()
+                + ", accepted=" + result.acceptedUrls()
+                + ", normalized=" + result.normalizedUrls()
+                + ", specs=" + loadedSpecs + "/" + result.acceptedUrls()
+                + ", +" + addedCount + " operation(s), failed=" + failed
+                + ", skipped=" + result.skippedLines() + canceledSuffix + ".");
+        progressLabel.setText("Progress: " + result.processedUrls() + "/" + result.acceptedUrls()
+                + (result.canceled() ? " (canceled)" : " (done)"));
+        log("URL list load completed: source=" + result.sourceLabel()
+                + ", lines=" + result.totalLines()
+                + ", acceptedUrls=" + result.acceptedUrls()
+                + ", normalizedUrls=" + result.normalizedUrls()
+                + ", skippedLines=" + result.skippedLines()
+                + ", specsLoaded=" + loadedSpecs
+                + ", processedUrls=" + result.processedUrls()
+                + ", addedOperations=" + addedCount
+                + ", failed=" + failed
+                + ", canceled=" + result.canceled()
+                + ", totalOperations=" + totalCount);
+
+        if (!result.failures().isEmpty())
+        {
+            int maxPreview = Math.min(5, result.failures().size());
+            for (int i = 0; i < maxPreview; i++)
+            {
+                log("URL list item failed: " + result.failures().get(i));
+            }
+            if (result.failures().size() > maxPreview)
+            {
+                log("URL list item failures omitted: +" + (result.failures().size() - maxPreview));
+            }
+        }
+        if (loadedSpecs == 0)
+        {
+            showError("URL list load result", "No OpenAPI specs were loaded. Check Event Log for item-level errors.");
+        }
+        persistUiState();
     }
 
     private void parseAndDisplaySpecAsync(
@@ -375,6 +1635,8 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         }
 
         loadingInProgress = true;
+        cancelRequested = false;
+        progressLabel.setText("Progress: running...");
         setLoadingState(true, statusMessage);
 
         CompletableFuture
@@ -390,16 +1652,20 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
                 }, workerPool)
                 .whenComplete((outcome, throwable) -> SwingUtilities.invokeLater(() -> {
                     loadingInProgress = false;
+                    cancelRequested = false;
                     setLoadingState(false, null);
 
                     if (throwable != null)
                     {
                         Throwable root = unwrap(throwable);
+                        progressLabel.setText("Progress: failed");
+                        registerLoadFailure(actionLabel, Utils.coalesce(root.getMessage(), root.getClass().getSimpleName()));
                         logError(actionLabel + " failed: " + root.getMessage(), toException(root));
                         showError(actionLabel + " error", "Unable to complete operation:\n" + root.getMessage());
                         return;
                     }
 
+                    progressLabel.setText("Progress: done");
                     applyParseOutcome(outcome);
                 }));
     }
@@ -407,7 +1673,8 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
     private void applyParseOutcome(ParseOutcome outcome)
     {
         int previousCount = model.operations().size();
-        model.load(outcome.openAPI(), outcome.sourceLocation());
+        model.load(outcome.openAPI(), outcome.sourceLocation(), outcome.sourceLabel());
+        refreshSourceSelector();
         refreshServerSelector();
         applyFilter();
         autoIncludeSpecHostInScope(outcome.sourceLocation());
@@ -426,6 +1693,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         }
 
         log("Loaded operations: +" + addedCount + ", total=" + totalCount);
+        persistUiState();
     }
 
     private void autoIncludeSpecHostInScope(String sourceLocation)
@@ -477,15 +1745,172 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
     private void setLoadingState(boolean loading, String statusText)
     {
         loadFileButton.setEnabled(!loading);
+        loadUrlListButton.setEnabled(!loading);
         fetchButton.setEnabled(!loading);
-        generateAllButton.setEnabled(!loading);
-        deleteSelectedButton.setEnabled(!loading);
-        repeaterSelectedButton.setEnabled(!loading);
-        intruderSelectedButton.setEnabled(!loading);
+        cancelLoadButton.setEnabled(loading);
 
         if (loading && Utils.nonBlank(statusText))
         {
             statusLabel.setText(statusText);
+        }
+    }
+
+    private void requestCancelUrlListLoad()
+    {
+        if (!loadingInProgress)
+        {
+            return;
+        }
+
+        cancelRequested = true;
+        progressLabel.setText("Progress: cancel requested...");
+        statusLabel.setText("Cancellation requested. Waiting for current request to finish...");
+    }
+
+    private void publishUrlListProgress(int processed, int total, String current)
+    {
+        SwingUtilities.invokeLater(() -> {
+            String suffix = Utils.nonBlank(current) ? " - " + current : "";
+            progressLabel.setText("Progress: " + processed + "/" + total + suffix);
+        });
+    }
+
+    private void registerLoadFailure(String source, String reason)
+    {
+        String normalizedSource = Utils.coalesce(source, "unknown");
+        String normalizedReason = Utils.coalesce(reason, "unknown error");
+        String line = normalizedSource + " -> " + normalizedReason;
+        lastLoadFailures.add(line);
+        refreshFailedRequestsArea();
+    }
+
+    private void replaceLoadFailures(List<String> failures)
+    {
+        lastLoadFailures.clear();
+        if (failures != null)
+        {
+            failures.stream()
+                    .filter(Utils::nonBlank)
+                    .forEach(lastLoadFailures::add);
+        }
+        refreshFailedRequestsArea();
+    }
+
+    private void clearLoadErrors()
+    {
+        lastLoadFailures.clear();
+        refreshFailedRequestsArea();
+    }
+
+    private void refreshFailedRequestsArea()
+    {
+        SwingUtilities.invokeLater(() -> {
+            if (lastLoadFailures.isEmpty())
+            {
+                failedSummaryLabel.setText("Load errors: none.");
+                copyFailedButton.setEnabled(false);
+                clearFailedButton.setEnabled(false);
+                return;
+            }
+
+            String first = compactErrorLine(lastLoadFailures.get(0));
+            if (lastLoadFailures.size() == 1)
+            {
+                failedSummaryLabel.setText("Load errors: 1 (" + first + ")");
+            }
+            else
+            {
+                failedSummaryLabel.setText("Load errors: " + lastLoadFailures.size() + " (e.g. " + first + ")");
+            }
+            copyFailedButton.setEnabled(true);
+            clearFailedButton.setEnabled(true);
+        });
+    }
+
+    private String compactErrorLine(String line)
+    {
+        String compact = Utils.coalesce(line).replace('\n', ' ').trim();
+        if (compact.length() > 120)
+        {
+            return compact.substring(0, 117) + "...";
+        }
+        return compact;
+    }
+
+    private void copyFailedUrlsToClipboard()
+    {
+        if (lastLoadFailures.isEmpty())
+        {
+            return;
+        }
+        Utils.copyToClipboard(String.join("\n", lastLoadFailures));
+        statusLabel.setText("Copied failed URL list to clipboard.");
+    }
+
+    private void persistUiState()
+    {
+        try
+        {
+            PersistedObject store = extensionDataStore();
+            if (store == null)
+            {
+                return;
+            }
+
+            store.setString(STATE_URL_FIELD, Utils.coalesce(urlField.getText()));
+            store.setString(STATE_FILTER_FIELD, Utils.coalesce(filterField.getText()));
+            store.setString(STATE_SERVER, Utils.coalesce(selectedServer(), DEFAULT_SERVER_ITEM));
+            store.setString(STATE_SOURCE, Utils.coalesce(selectedSourceId()));
+        }
+        catch (Exception ex)
+        {
+            logError("Unable to persist UI state: " + ex.getMessage(), ex);
+        }
+    }
+
+    private void restoreUiState()
+    {
+        try
+        {
+            PersistedObject store = extensionDataStore();
+            if (store == null)
+            {
+                return;
+            }
+
+            String storedUrl = Utils.coalesce(store.getString(STATE_URL_FIELD));
+            if (Utils.nonBlank(storedUrl))
+            {
+                urlField.setText(storedUrl);
+            }
+
+            String storedFilter = Utils.coalesce(store.getString(STATE_FILTER_FIELD));
+            if (Utils.nonBlank(storedFilter))
+            {
+                filterField.setText(storedFilter);
+            }
+
+            String storedServer = Utils.coalesce(store.getString(STATE_SERVER), DEFAULT_SERVER_ITEM);
+            restoredServer = Utils.coalesce(storedServer);
+
+            String storedSource = Utils.coalesce(store.getString(STATE_SOURCE));
+            restoredSourceId = Utils.coalesce(storedSource);
+        }
+        catch (Exception ex)
+        {
+            logError("Unable to restore UI state: " + ex.getMessage(), ex);
+        }
+    }
+
+    private PersistedObject extensionDataStore()
+    {
+        try
+        {
+            return api.persistence() != null ? api.persistence().extensionData() : null;
+        }
+        catch (Exception ex)
+        {
+            return null;
         }
     }
 
@@ -521,22 +1946,25 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
     private void refreshServerSelector()
     {
         String previous = (String) serverSelector.getSelectedItem();
+        String targetServer = Utils.nonBlank(restoredServer) ? restoredServer : previous;
+        String selectedSourceId = selectedSourceId();
 
         serverSelector.removeAllItems();
         serverSelector.addItem(DEFAULT_SERVER_ITEM);
 
-        for (String server : model.availableServers())
+        for (String server : model.availableServers(selectedSourceId))
         {
             serverSelector.addItem(server);
         }
 
-        if (previous != null)
+        if (targetServer != null)
         {
             for (int i = 0; i < serverSelector.getItemCount(); i++)
             {
-                if (previous.equals(serverSelector.getItemAt(i)))
+                if (targetServer.equals(serverSelector.getItemAt(i)))
                 {
                     serverSelector.setSelectedIndex(i);
+                    restoredServer = "";
                     return;
                 }
             }
@@ -547,11 +1975,54 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
 
     private void applyFilter()
     {
-        List<OpenApiParserModel.OperationContext> filtered = model.filter(filterField.getText(), selectedServer());
+        List<OpenApiParserModel.OperationContext> filtered = model.filter(filterField.getText(), selectedServer(), selectedSourceId());
         table.setOperations(filtered);
 
         statusLabel.setText("Showing " + filtered.size() + " / " + model.operations().size() + " operation(s)");
         refreshRequestPreviewFromSelection();
+    }
+
+    private void refreshSourceSelector()
+    {
+        String previous = selectedSourceId();
+        String targetSourceId = Utils.nonBlank(restoredSourceId) ? restoredSourceId : previous;
+
+        sourceSelector.removeAllItems();
+        sourceSelector.addItem(SourceSelection.allSources());
+
+        for (OpenApiParserModel.SourceContext source : model.availableSources())
+        {
+            if (source == null || Utils.isBlank(source.id()))
+            {
+                continue;
+            }
+            sourceSelector.addItem(new SourceSelection(source.id(), source.label()));
+        }
+
+        if (Utils.nonBlank(targetSourceId))
+        {
+            for (int i = 0; i < sourceSelector.getItemCount(); i++)
+            {
+                SourceSelection item = sourceSelector.getItemAt(i);
+                if (item != null && targetSourceId.equals(item.id()))
+                {
+                    sourceSelector.setSelectedIndex(i);
+                    restoredSourceId = "";
+                    return;
+                }
+            }
+        }
+        sourceSelector.setSelectedIndex(0);
+    }
+
+    private String selectedSourceId()
+    {
+        Object selected = sourceSelector.getSelectedItem();
+        if (selected instanceof SourceSelection sourceSelection)
+        {
+            return Utils.coalesce(sourceSelection.id());
+        }
+        return "";
     }
 
     private void onTableSelectionChanged(OpenApiParserModel.OperationContext operationContext)
@@ -580,10 +2051,9 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
     {
         try
         {
-            HttpRequest request = requestGenerator.generate(operationContext, selectedServer(), model.availableServers());
+            HttpRequest request = requestGenerator.generate(operationContext, selectedServer(), fallbackServersForOperation(operationContext));
             requestPreviewEditor.setRequest(request);
             requestPreviewLabel.setText("Request preview: " + operationContext.method() + " " + operationContext.path());
-            previewOperationContext = operationContext;
         }
         catch (Exception ex)
         {
@@ -596,7 +2066,6 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
     {
         requestPreviewLabel.setText(label);
         requestPreviewEditor.setRequest(previewPlaceholderRequest());
-        previewOperationContext = null;
     }
 
     private HttpRequest previewPlaceholderRequest()
@@ -608,7 +2077,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
     {
         try
         {
-            HttpRequest request = requestGenerator.generate(operationContext, selectedServer(), model.availableServers());
+            HttpRequest request = requestGenerator.generate(operationContext, selectedServer(), fallbackServersForOperation(operationContext));
 
             switch (action)
             {
@@ -641,7 +2110,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         statusLabel.setText("Python requests snippet copied to clipboard.");
     }
 
-    private void onGenerateAllRequests()
+    private void sendVisibleToRepeater()
     {
         List<OpenApiParserModel.OperationContext> operations = table.visibleOperations();
         if (operations.isEmpty())
@@ -657,8 +2126,8 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         {
             try
             {
-                HttpRequest request = requestGenerator.generate(operation, selectedServer(), model.availableServers());
-                String tabName = "OpenAPI Parser / All / " + operation.method() + " " + operation.path();
+                HttpRequest request = requestGenerator.generate(operation, selectedServer(), fallbackServersForOperation(operation));
+                String tabName = repeaterTabName("All", operation, request);
                 api.repeater().sendToRepeater(request, tabName);
                 sent++;
             }
@@ -670,38 +2139,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         }
 
         statusLabel.setText("Generated " + sent + " request(s), failed: " + failed);
-        log("Generate all requests completed. Sent=" + sent + ", Failed=" + failed);
-    }
-
-    private void onDeleteSelected()
-    {
-        List<OpenApiParserModel.OperationContext> selected = selectedOperationsOrWarn("Delete");
-        if (selected.isEmpty())
-        {
-            return;
-        }
-
-        deleteSelectedOperations(selected, true);
-    }
-
-    private void onSendSelectedToRepeater()
-    {
-        List<OpenApiParserModel.OperationContext> selected = selectedOperationsOrWarn("Send to Repeater");
-        if (selected.isEmpty())
-        {
-            return;
-        }
-        sendSelectedToRepeater(selected);
-    }
-
-    private void onSendSelectedToIntruder()
-    {
-        List<OpenApiParserModel.OperationContext> selected = selectedOperationsOrWarn("Send to Intruder");
-        if (selected.isEmpty())
-        {
-            return;
-        }
-        sendSelectedToIntruder(selected);
+        log("Visible -> Repeater completed. Sent=" + sent + ", Failed=" + failed);
     }
 
     private void onSelectionAction(OpenApiParserTable.SelectionAction action, List<OpenApiParserModel.OperationContext> selected)
@@ -713,6 +2151,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
 
         switch (action)
         {
+            case SEND_VISIBLE_TO_REPEATER -> sendVisibleToRepeater();
             case SEND_SELECTED_TO_REPEATER -> {
                 if (!ensureSelectionForPopup(selected, "Send selected to Repeater"))
                 {
@@ -727,6 +2166,20 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
                 }
                 sendSelectedToIntruder(selected);
             }
+            case SEND_SELECTED_TO_ACTIVE_SCAN -> {
+                if (!ensureSelectionForPopup(selected, "Send selected to Active scan"))
+                {
+                    return;
+                }
+                sendSelectedToAudit(selected, true);
+            }
+            case SEND_SELECTED_TO_PASSIVE_SCAN -> {
+                if (!ensureSelectionForPopup(selected, "Send selected to Passive scan"))
+                {
+                    return;
+                }
+                sendSelectedToAudit(selected, false);
+            }
             case COPY_SELECTED_AS_CURL -> {
                 if (!ensureSelectionForPopup(selected, "Copy selected as cURL"))
                 {
@@ -740,6 +2193,13 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
                     return;
                 }
                 copySelectedAsPython(selected);
+            }
+            case EXPORT_SELECTED_REQUESTS -> {
+                if (!ensureSelectionForPopup(selected, "Export selected requests"))
+                {
+                    return;
+                }
+                exportSelectedRequests(selected);
             }
             case DELETE_SELECTED -> {
                 if (!ensureSelectionForPopup(selected, "Delete selected rows"))
@@ -765,17 +2225,6 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         return true;
     }
 
-    private List<OpenApiParserModel.OperationContext> selectedOperationsOrWarn(String action)
-    {
-        List<OpenApiParserModel.OperationContext> selected = table.selectedOperations();
-        if (selected.isEmpty())
-        {
-            showError("No selection", "Select one or more rows first for: " + action);
-            return List.of();
-        }
-        return selected;
-    }
-
     private void deleteSelectedOperations(List<OpenApiParserModel.OperationContext> selected, boolean confirm)
     {
         if (confirm)
@@ -795,6 +2244,8 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
 
         int removed = model.removeOperations(selected);
         table.clearSelection();
+        refreshSourceSelector();
+        refreshServerSelector();
         applyFilter();
         statusLabel.setText("Removed " + removed + " operation(s).");
         log("Removed selected operations: " + removed);
@@ -808,8 +2259,8 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         {
             try
             {
-                HttpRequest request = requestGenerator.generate(operation, selectedServer(), model.availableServers());
-                String tabName = "OpenAPI Parser / Selected / " + operation.method() + " " + operation.path();
+                HttpRequest request = requestGenerator.generate(operation, selectedServer(), fallbackServersForOperation(operation));
+                String tabName = repeaterTabName("Selected", operation, request);
                 api.repeater().sendToRepeater(request, tabName);
                 sent++;
             }
@@ -824,6 +2275,48 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         log("Selected requests sent to Repeater. Sent=" + sent + ", Failed=" + failed);
     }
 
+    private String repeaterTabName(String bucket, OpenApiParserModel.OperationContext operation, HttpRequest request)
+    {
+        String host = "unknown-host";
+        String endpoint = Utils.coalesce(operation != null ? operation.path() : null, "/");
+        String method = Utils.coalesce(operation != null ? operation.method() : null, "GET").toUpperCase();
+
+        try
+        {
+            String requestUrl = request != null ? request.url() : "";
+            if (Utils.looksLikeHttpUrl(requestUrl))
+            {
+                URI uri = URI.create(requestUrl);
+                if (Utils.nonBlank(uri.getHost()))
+                {
+                    host = uri.getHost();
+                }
+                else if (Utils.nonBlank(uri.getAuthority()))
+                {
+                    host = uri.getAuthority();
+                }
+            }
+        }
+        catch (Exception ignored)
+        {
+            // Keep fallback host when request URL cannot be parsed.
+        }
+
+        try
+        {
+            if (request != null && Utils.nonBlank(request.pathWithoutQuery()))
+            {
+                endpoint = request.pathWithoutQuery();
+            }
+        }
+        catch (Exception ignored)
+        {
+            // Keep operation-path fallback.
+        }
+
+        return "OpenAPI Parser / " + bucket + " / " + host + " / " + method + " " + endpoint;
+    }
+
     private void sendSelectedToIntruder(List<OpenApiParserModel.OperationContext> selected)
     {
         int sent = 0;
@@ -832,7 +2325,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         {
             try
             {
-                HttpRequest request = requestGenerator.generate(operation, selectedServer(), model.availableServers());
+                HttpRequest request = requestGenerator.generate(operation, selectedServer(), fallbackServersForOperation(operation));
                 api.intruder().sendToIntruder(request);
                 sent++;
             }
@@ -847,574 +2340,225 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         log("Selected requests sent to Intruder. Sent=" + sent + ", Failed=" + failed);
     }
 
-    private void sendSelectedToScanner(
-            BuiltInAuditConfiguration auditConfiguration,
-            String label,
-            List<OpenApiParserModel.OperationContext> selected)
+    private void sendSelectedToAudit(List<OpenApiParserModel.OperationContext> selected, boolean active)
     {
-        boolean passiveMode = auditConfiguration == BuiltInAuditConfiguration.LEGACY_PASSIVE_AUDIT_CHECKS;
-        String serverSelection = selectedServer();
-        List<String> globalServers = model.availableServers();
-        List<OpenApiParserModel.OperationContext> immutableSelection = selected.stream()
-                .filter(Objects::nonNull)
-                .toList();
-
-        if (immutableSelection.isEmpty())
+        if (selected == null || selected.isEmpty())
         {
-            showError("Scanner queue error", "No valid operation rows selected.");
             return;
         }
 
-        String modeTitle = passiveMode ? "Passive scan" : "Active scan";
-
-        statusLabel.setText(modeTitle + ": queueing " + immutableSelection.size() + " operation(s)...");
-        scannerStatusLabel.setText(modeTitle + " task: queueing...");
-
-        HttpRequest previewRequestOverride = capturePreviewRequestForSelection(immutableSelection);
-        CompletableFuture
-                .supplyAsync(() -> {
-                    try
-                    {
-                        return queueSelectedForScanner(
-                                auditConfiguration,
-                                label,
-                                immutableSelection,
-                                serverSelection,
-                                globalServers,
-                                passiveMode,
-                                previewRequestOverride
-                        );
-                    }
-                    catch (Exception ex)
-                    {
-                        throw new CompletionException(ex);
-                    }
-                }, workerPool)
-                .whenComplete((result, throwable) -> SwingUtilities.invokeLater(() -> {
-                    if (throwable != null)
-                    {
-                        Throwable root = unwrap(throwable);
-                        Exception error = toException(root);
-                        scannerStatusLabel.setText(modeTitle + " task: queue failed");
-                        logError(label + " queue failed: " + root.getMessage(), error);
-                        showError("Scanner queue error", "Unable to queue selected requests.\n" + root.getMessage());
-                        return;
-                    }
-
-                    String outOfScopeSuffix = result.outOfScope() > 0
-                            ? ", out-of-scope=" + result.outOfScope()
-                            : "";
-                    String autoIncludedSuffix = result.autoIncluded() > 0
-                            ? ", auto-included=" + result.autoIncluded()
-                            : "";
-
-                    statusLabel.setText(modeTitle + ": queued=" + result.queued() + ", failed=" + result.failed() + outOfScopeSuffix + autoIncludedSuffix);
-                    scannerStatusLabel.setText(modeTitle + " task updated: +" + result.queued()
-                            + " request(s), failed=" + result.failed() + outOfScopeSuffix + autoIncludedSuffix);
-
-                    log(label + " queued for selected operations. Queued=" + result.queued()
-                            + ", Failed=" + result.failed()
-                            + ", OutOfScope=" + result.outOfScope()
-                            + ", AutoIncluded=" + result.autoIncluded());
-                    log(label + " task metrics: status=\"" + result.auditStatus() + "\""
-                            + ", requests=" + result.auditRequests()
-                            + ", errors=" + result.auditErrors()
-                            + ", insertionPoints=" + result.auditInsertionPoints());
-
-                    if (result.outOfScope() > 0)
-                    {
-                        log(label + " warning: " + result.outOfScope()
-                                + " request(s) are out of scope. If Burp scanner is configured to scan in-scope items only, no new audit items will appear.");
-                    }
-                    if (result.queued() == 0)
-                    {
-                        showError("Scanner queue is empty", label + " did not queue any request.\nCheck Event Log for generation/fetch errors.");
-                    }
-                }));
+        String mode = active ? "Active" : "Passive";
+        statusLabel.setText(mode + " scan: queuing " + selected.size() + " request(s)...");
+        workerPool.submit(() -> queueSelectedForAudit(selected, active));
     }
 
-    private HttpRequest capturePreviewRequestForSelection(List<OpenApiParserModel.OperationContext> selected)
+    private void queueSelectedForAudit(List<OpenApiParserModel.OperationContext> selected, boolean active)
     {
-        if (selected == null || selected.size() != 1)
-        {
-            return null;
-        }
-
-        OpenApiParserModel.OperationContext selectedOperation = selected.get(0);
-        if (selectedOperation == null || previewOperationContext == null || !selectedOperation.equals(previewOperationContext))
-        {
-            return null;
-        }
-
+        String mode = active ? "Active" : "Passive";
+        Audit audit;
         try
         {
-            HttpRequest previewRequest = requestPreviewEditor.getRequest();
-            if (previewRequest != null && Utils.nonBlank(previewRequest.url()))
-            {
-                return previewRequest;
-            }
+            audit = getOrCreateAuditTask(active);
         }
         catch (Exception ex)
         {
-            logError("Unable to read preview request for scanner fallback: " + ex.getMessage(), ex);
-        }
-        return null;
-    }
-
-    private Audit startAuditOnEdt(BuiltInAuditConfiguration auditConfiguration) throws Exception
-    {
-        if (SwingUtilities.isEventDispatchThread())
-        {
-            return api.scanner().startAudit(AuditConfiguration.auditConfiguration(auditConfiguration));
-        }
-
-        AtomicReference<Audit> created = new AtomicReference<>();
-        AtomicReference<Exception> callError = new AtomicReference<>();
-        SwingUtilities.invokeAndWait(() -> {
-            try
-            {
-                created.set(api.scanner().startAudit(AuditConfiguration.auditConfiguration(auditConfiguration)));
-            }
-            catch (Exception ex)
-            {
-                callError.set(ex);
-            }
-        });
-
-        if (callError.get() != null)
-        {
-            throw callError.get();
-        }
-        return created.get();
-    }
-
-    private HttpRequestResponse fetchBaselineResponse(HttpRequest request) throws IOException
-    {
-        RequestOptions options = RequestOptions.requestOptions()
-                .withResponseTimeout(30_000)
-                .withRedirectionMode(RedirectionMode.ALWAYS);
-
-        HttpRequestResponse response = api.http().sendRequest(request, options);
-        if (response == null || !response.hasResponse())
-        {
-            throw new IOException("No response returned while preparing scanner request.");
-        }
-        return response;
-    }
-
-    private ScannerQueueResult queueSelectedForScanner(
-            BuiltInAuditConfiguration auditConfiguration,
-            String label,
-            List<OpenApiParserModel.OperationContext> selected,
-            String serverSelection,
-            List<String> globalServers,
-            boolean passiveMode,
-            HttpRequest previewRequestOverride)
-    {
-        Audit workingAudit;
-        try
-        {
-            workingAudit = startAuditOnEdt(auditConfiguration);
-        }
-        catch (Exception ex)
-        {
-            throw new IllegalStateException("Unable to start " + (passiveMode ? "passive" : "active")
-                    + " audit task: " + ex.getMessage(), ex);
+            logError(mode + " scan unavailable: " + ex.getMessage(), ex);
+            SwingUtilities.invokeLater(() -> {
+                statusLabel.setText(mode + " scan unavailable.");
+                showError(
+                        mode + " scan unavailable",
+                        mode + " scan could not be started. Check Burp Scanner availability and license."
+                );
+            });
+            return;
         }
 
         int queued = 0;
         int failed = 0;
-        int outOfScope = 0;
         int autoIncluded = 0;
-
-        for (int idx = 0; idx < selected.size(); idx++)
+        int recreated = 0;
+        int retried = 0;
+        for (OpenApiParserModel.OperationContext operation : selected)
         {
-            OpenApiParserModel.OperationContext operation = selected.get(idx);
+            HttpRequest request;
             try
             {
-                HttpRequest request;
-                if (idx == 0 && previewRequestOverride != null)
-                {
-                    request = previewRequestOverride;
-                }
-                else
-                {
-                    request = requestGenerator.generate(operation, serverSelection, globalServers);
-                }
-                ScopeResult scopeResult = ensureRequestInScope(request, label, operation);
-                if (scopeResult.autoIncluded())
-                {
-                    autoIncluded++;
-                }
-                if (!scopeResult.inScope())
-                {
-                    outOfScope++;
-                }
-
-                HttpRequestResponse requestResponse = null;
-                try
-                {
-                    requestResponse = fetchBaselineResponse(request);
-                    api.siteMap().add(requestResponse);
-                }
-                catch (Exception baselineEx)
-                {
-                    String modeName = passiveMode ? "passive" : "active";
-                    logError("Baseline response unavailable for " + modeName + " scan "
-                            + operation.method() + " " + operation.path()
-                            + "; fallback to request-only queue. Reason: " + baselineEx.getMessage(), toException(baselineEx));
-                }
-
-                workingAudit = enqueueIntoAudit(
-                        workingAudit,
-                        passiveMode,
-                        request,
-                        requestResponse,
-                        label
-                );
-                queued++;
+                request = requestGenerator.generate(operation, selectedServer(), fallbackServersForOperation(operation));
+                autoIncluded += autoIncludeRequestHostInScope(request);
             }
             catch (Exception ex)
             {
                 failed++;
-                logError(label + " failed for " + operation.method() + " " + operation.path() + ": " + ex.getMessage(), ex);
+                logError(mode + " scan queue failed for " + operation.method() + " " + operation.path() + ": " + ex.getMessage(), ex);
+                continue;
             }
-        }
 
-        return new ScannerQueueResult(
-                queued,
-                failed,
-                outOfScope,
-                autoIncluded,
-                safeAuditStatusMessage(workingAudit),
-                safeAuditRequestCount(workingAudit),
-                safeAuditErrorCount(workingAudit),
-                safeAuditInsertionPointCount(workingAudit)
-        );
-    }
-
-    private String safeAuditStatusMessage(Audit audit)
-    {
-        if (audit == null)
-        {
-            return "n/a";
-        }
-
-        try
-        {
-            return Utils.coalesce(audit.statusMessage(), "n/a");
-        }
-        catch (Exception ex)
-        {
-            return "n/a";
-        }
-    }
-
-    private int safeAuditRequestCount(Audit audit)
-    {
-        if (audit == null)
-        {
-            return -1;
-        }
-
-        try
-        {
-            return audit.requestCount();
-        }
-        catch (Exception ex)
-        {
-            return -1;
-        }
-    }
-
-    private int safeAuditErrorCount(Audit audit)
-    {
-        if (audit == null)
-        {
-            return -1;
-        }
-
-        try
-        {
-            return audit.errorCount();
-        }
-        catch (Exception ex)
-        {
-            return -1;
-        }
-    }
-
-    private int safeAuditInsertionPointCount(Audit audit)
-    {
-        if (audit == null)
-        {
-            return -1;
-        }
-
-        try
-        {
-            return audit.insertionPointCount();
-        }
-        catch (Exception ex)
-        {
-            return -1;
-        }
-    }
-
-    private Audit enqueueIntoAudit(
-            Audit audit,
-            boolean passiveMode,
-            HttpRequest request,
-            HttpRequestResponse requestResponse,
-            String label) throws Exception
-    {
-        if (SwingUtilities.isEventDispatchThread())
-        {
-            return enqueueIntoAuditInternal(audit, passiveMode, request, requestResponse, label);
-        }
-
-        AtomicReference<Audit> result = new AtomicReference<>();
-        AtomicReference<Exception> callError = new AtomicReference<>();
-        SwingUtilities.invokeAndWait(() -> {
             try
             {
-                result.set(enqueueIntoAuditInternal(audit, passiveMode, request, requestResponse, label));
-            }
-            catch (Exception ex)
-            {
-                callError.set(ex);
-            }
-        });
-
-        if (callError.get() != null)
-        {
-            throw callError.get();
-        }
-        return result.get();
-    }
-
-    private Audit enqueueIntoAuditInternal(
-            Audit audit,
-            boolean passiveMode,
-            HttpRequest request,
-            HttpRequestResponse requestResponse,
-            String label) throws Exception
-    {
-        if (audit == null)
-        {
-            throw new IllegalStateException("Audit task is null.");
-        }
-
-        if (passiveMode)
-        {
-            if (requestResponse != null)
-            {
-                audit.addRequestResponse(requestResponse);
-            }
-            else
-            {
                 audit.addRequest(request);
+                queued++;
             }
-            return audit;
-        }
-
-        List<Range> insertionPoints = buildActiveInsertionPoints(request);
-        if (!insertionPoints.isEmpty())
-        {
-            audit.addRequest(request, insertionPoints);
-            return audit;
-        }
-
-        if (requestResponse != null)
-        {
-            audit.addRequestResponse(requestResponse);
-        }
-        else
-        {
-            audit.addRequest(request);
-        }
-        log(label + " warning: request has no parsed insertion points, queued with generic active mode.");
-        return audit;
-    }
-
-    private List<Range> buildActiveInsertionPoints(HttpRequest request)
-    {
-        List<Range> ranges = new ArrayList<>();
-        if (request == null)
-        {
-            return ranges;
-        }
-
-        try
-        {
-            for (ParsedHttpParameter parameter : request.parameters())
+            catch (Exception addEx)
             {
-                if (parameter == null || parameter.valueOffsets() == null)
+                if (!isAuditTaskUsable(audit))
                 {
-                    continue;
+                    try
+                    {
+                        log(mode + " scan task is unavailable. Recreating task and retrying request.");
+                        audit = replaceAuditTask(active);
+                        recreated++;
+                        audit.addRequest(request);
+                        queued++;
+                        retried++;
+                    }
+                    catch (Exception retryEx)
+                    {
+                        failed++;
+                        logError(mode + " scan retry failed for " + operation.method() + " " + operation.path() + ": " + retryEx.getMessage(), retryEx);
+                    }
                 }
-                Range valueOffsets = parameter.valueOffsets();
-                if (valueOffsets.endIndexExclusive() > valueOffsets.startIndexInclusive())
+                else
                 {
-                    ranges.add(valueOffsets);
+                    failed++;
+                    logError(mode + " scan queue failed for " + operation.method() + " " + operation.path() + ": " + addEx.getMessage(), addEx);
                 }
             }
         }
-        catch (Exception ex)
-        {
-            logError("Unable to parse parameter insertion points: " + ex.getMessage(), ex);
-        }
 
-        if (!ranges.isEmpty())
-        {
-            return dedupeRanges(ranges);
-        }
-
-        Range bodyRange = firstBodyValueRange(request);
-        if (bodyRange != null)
-        {
-            ranges.add(bodyRange);
-            return ranges;
-        }
-
-        Range pathRange = firstPathSegmentRange(request);
-        if (pathRange != null)
-        {
-            ranges.add(pathRange);
-        }
-        return ranges;
+        int queuedFinal = queued;
+        int failedFinal = failed;
+        int autoIncludedFinal = autoIncluded;
+        int recreatedFinal = recreated;
+        int retriedFinal = retried;
+        SwingUtilities.invokeLater(() ->
+                statusLabel.setText(mode + " scan queued: queued=" + queuedFinal
+                        + ", failed=" + failedFinal
+                        + ", recreated=" + recreatedFinal
+                        + ", retried=" + retriedFinal + "."));
+        log(mode + " scan queued for selected operations. Queued=" + queuedFinal
+                + ", Failed=" + failedFinal
+                + ", AutoIncluded=" + autoIncludedFinal
+                + ", Recreated=" + recreatedFinal
+                + ", Retried=" + retriedFinal);
     }
 
-    private List<Range> dedupeRanges(List<Range> ranges)
+    private Audit getOrCreateAuditTask(boolean active)
     {
-        if (ranges == null || ranges.isEmpty())
+        synchronized (auditLock)
         {
-            return List.of();
-        }
-
-        List<Range> deduped = new ArrayList<>();
-        Set<String> seen = ConcurrentHashMap.newKeySet();
-        for (Range range : ranges)
-        {
-            if (range == null)
+            Audit cached = active ? activeAuditTask : passiveAuditTask;
+            if (isAuditTaskUsable(cached))
             {
-                continue;
+                return cached;
             }
-            int start = range.startIndexInclusive();
-            int end = range.endIndexExclusive();
-            if (end <= start)
+            if (cached != null)
             {
-                continue;
+                log((active ? "Active" : "Passive") + " scan task became unavailable. Creating a new task.");
             }
-
-            String key = start + ":" + end;
-            if (seen.add(key))
-            {
-                deduped.add(Range.range(start, end));
-            }
-        }
-        return deduped;
-    }
-
-    private Range firstBodyValueRange(HttpRequest request)
-    {
-        try
-        {
-            String body = request.bodyToString();
-            if (Utils.isBlank(body))
-            {
-                return null;
-            }
-
-            int localStart = firstAlphaNumericIndex(body);
-            if (localStart < 0)
-            {
-                return null;
-            }
-
-            int localEnd = Math.min(body.length(), localStart + 16);
-            return Range.range(request.bodyOffset() + localStart, request.bodyOffset() + localEnd);
-        }
-        catch (Exception ex)
-        {
-            return null;
+            return replaceAuditTaskLocked(active);
         }
     }
 
-    private Range firstPathSegmentRange(HttpRequest request)
+    private boolean isAuditTaskUsable(Audit task)
     {
-        try
-        {
-            String raw = request.toString();
-            int firstSpace = raw.indexOf(' ');
-            if (firstSpace < 0)
-            {
-                return null;
-            }
-
-            int secondSpace = raw.indexOf(' ', firstSpace + 1);
-            if (secondSpace <= firstSpace + 1)
-            {
-                return null;
-            }
-
-            String pathPart = raw.substring(firstSpace + 1, secondSpace);
-            int pathStart = 0;
-            while (pathStart < pathPart.length() && (pathPart.charAt(pathStart) == '/' || pathPart.charAt(pathStart) == '?'))
-            {
-                pathStart++;
-            }
-
-            if (pathStart >= pathPart.length())
-            {
-                return null;
-            }
-
-            int pathEnd = pathStart;
-            while (pathEnd < pathPart.length() && pathPart.charAt(pathEnd) != '/' && pathPart.charAt(pathEnd) != '?' && pathPart.charAt(pathEnd) != '&')
-            {
-                pathEnd++;
-            }
-
-            int start = firstSpace + 1 + pathStart;
-            int end = firstSpace + 1 + pathEnd;
-            if (end <= start)
-            {
-                return null;
-            }
-            return Range.range(start, end);
-        }
-        catch (Exception ex)
-        {
-            return null;
-        }
-    }
-
-    private int firstAlphaNumericIndex(String value)
-    {
-        if (Utils.isBlank(value))
-        {
-            return -1;
-        }
-
-        for (int i = 0; i < value.length(); i++)
-        {
-            if (Character.isLetterOrDigit(value.charAt(i)))
-            {
-                return i;
-            }
-        }
-        return -1;
-    }
-
-    private boolean isRequestInScope(HttpRequest request)
-    {
-        if (request == null || Utils.isBlank(request.url()))
+        if (task == null)
         {
             return false;
         }
+        try
+        {
+            task.statusMessage();
+            task.requestCount();
+            return true;
+        }
+        catch (Exception ignored)
+        {
+            return false;
+        }
+    }
 
-        return isUrlInScope(request.url());
+    private Audit replaceAuditTask(boolean active)
+    {
+        synchronized (auditLock)
+        {
+            return replaceAuditTaskLocked(active);
+        }
+    }
+
+    private Audit replaceAuditTaskLocked(boolean active)
+    {
+        if (active)
+        {
+            activeAuditTask = null;
+        }
+        else
+        {
+            passiveAuditTask = null;
+        }
+
+        Audit created = createAuditTask(active);
+        if (active)
+        {
+            activeAuditTask = created;
+        }
+        else
+        {
+            passiveAuditTask = created;
+        }
+        return created;
+    }
+
+    private Audit createAuditTask(boolean active)
+    {
+        BuiltInAuditConfiguration configuration = active
+                ? BuiltInAuditConfiguration.LEGACY_ACTIVE_AUDIT_CHECKS
+                : BuiltInAuditConfiguration.LEGACY_PASSIVE_AUDIT_CHECKS;
+        Audit created = api.scanner().startAudit(AuditConfiguration.auditConfiguration(configuration));
+        log((active ? "Active" : "Passive") + " audit task started.");
+        return created;
+    }
+
+    private int autoIncludeRequestHostInScope(HttpRequest request)
+    {
+        if (request == null || Utils.isBlank(request.url()) || !Utils.looksLikeHttpUrl(request.url()))
+        {
+            return 0;
+        }
+
+        final String scopeTarget;
+        try
+        {
+            URI uri = URI.create(request.url());
+            if (Utils.isBlank(uri.getScheme()) || Utils.isBlank(uri.getAuthority()))
+            {
+                return 0;
+            }
+            scopeTarget = uri.getScheme() + "://" + uri.getAuthority() + "/";
+        }
+        catch (Exception ex)
+        {
+            logError("Failed to parse request URL for scope include: " + ex.getMessage(), ex);
+            return 0;
+        }
+
+        if (autoIncludedHosts.contains(scopeTarget) || isUrlInScope(scopeTarget))
+        {
+            autoIncludedHosts.add(scopeTarget);
+            return 0;
+        }
+
+        try
+        {
+            includeInScopeOnEdt(scopeTarget);
+            autoIncludedHosts.add(scopeTarget);
+            log("Auto-included request host in scope: " + scopeTarget);
+            return 1;
+        }
+        catch (Exception ex)
+        {
+            logError("Failed to auto-include request host in scope: " + ex.getMessage(), ex);
+            return 0;
+        }
     }
 
     private boolean isUrlInScope(String url)
@@ -1431,59 +2575,6 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         {
             logError("Failed to check scope state for scanner request: " + ex.getMessage(), ex);
             return false;
-        }
-    }
-
-    private ScopeResult ensureRequestInScope(
-            HttpRequest request,
-            String label,
-            OpenApiParserModel.OperationContext operation)
-    {
-        if (request == null || Utils.isBlank(request.url()))
-        {
-            return new ScopeResult(false, false);
-        }
-
-        try
-        {
-            String hostScopeUrl = toHostScopeUrl(request);
-            boolean autoIncluded = false;
-            if (Utils.nonBlank(hostScopeUrl) && !isUrlInScope(hostScopeUrl))
-            {
-                includeInScopeOnEdt(hostScopeUrl);
-                autoIncludedHosts.add(hostScopeUrl);
-                autoIncluded = true;
-            }
-
-            boolean nowInScope = isRequestInScope(request);
-            if (!nowInScope)
-            {
-                // Fallback to exact URL if host-level include did not match this request.
-                includeInScopeOnEdt(request.url());
-                autoIncluded = true;
-                nowInScope = isRequestInScope(request);
-            }
-            if (nowInScope)
-            {
-                if (autoIncluded)
-                {
-                    String scopeTarget = Utils.nonBlank(hostScopeUrl) ? hostScopeUrl : request.url();
-                    log(label + " auto-included in scope: " + operation.method() + " " + operation.path() + " -> " + scopeTarget);
-                }
-                return new ScopeResult(true, autoIncluded);
-            }
-            if (Utils.nonBlank(hostScopeUrl))
-            {
-                autoIncludedHosts.remove(hostScopeUrl);
-            }
-            log(label + " scope check failed for " + operation.method() + " " + operation.path()
-                    + " -> " + request.url());
-            return new ScopeResult(false, autoIncluded);
-        }
-        catch (Exception ex)
-        {
-            logError("Failed to include request in scope before scanner queue: " + ex.getMessage(), ex);
-            return new ScopeResult(false, false);
         }
     }
 
@@ -1516,38 +2607,6 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         }
     }
 
-    private String toHostScopeUrl(HttpRequest request)
-    {
-        try
-        {
-            if (request != null && request.httpService() != null && Utils.nonBlank(request.httpService().host()))
-            {
-                String host = request.httpService().host();
-                boolean secure = request.httpService().secure();
-                int port = request.httpService().port();
-                boolean defaultPort = (secure && port == 443) || (!secure && port == 80);
-
-                StringBuilder authority = new StringBuilder(host);
-                if (port > 0 && !defaultPort)
-                {
-                    authority.append(':').append(port);
-                }
-                return (secure ? "https://" : "http://") + authority + "/";
-            }
-
-            URI uri = URI.create(request != null ? request.url() : "");
-            if (Utils.isBlank(uri.getScheme()) || Utils.isBlank(uri.getAuthority()))
-            {
-                return "";
-            }
-            return uri.getScheme() + "://" + uri.getAuthority() + "/";
-        }
-        catch (Exception ignored)
-        {
-            return "";
-        }
-    }
-
     private void copySelectedAsCurl(List<OpenApiParserModel.OperationContext> selected)
     {
         StringBuilder all = new StringBuilder();
@@ -1558,7 +2617,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         {
             try
             {
-                HttpRequest request = requestGenerator.generate(operation, selectedServer(), model.availableServers());
+                HttpRequest request = requestGenerator.generate(operation, selectedServer(), fallbackServersForOperation(operation));
                 if (all.length() > 0)
                 {
                     all.append("\n\n# ----------------------------------------\n\n");
@@ -1592,7 +2651,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         {
             try
             {
-                HttpRequest request = requestGenerator.generate(operation, selectedServer(), model.availableServers());
+                HttpRequest request = requestGenerator.generate(operation, selectedServer(), fallbackServersForOperation(operation));
                 if (all.length() > 0)
                 {
                     all.append("\n\n# ========================================\n\n");
@@ -1616,10 +2675,129 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         }
     }
 
+    private void exportSelectedRequests(List<OpenApiParserModel.OperationContext> selected)
+    {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle("Export selected requests");
+        chooser.setSelectedFile(new File("openapi-parser-requests.txt"));
+
+        int result = chooser.showSaveDialog(rootPanel);
+        if (result != JFileChooser.APPROVE_OPTION)
+        {
+            return;
+        }
+
+        Path outputPath = chooser.getSelectedFile().toPath();
+        ExportDocument exportDocument;
+        try
+        {
+            exportDocument = buildExportDocument(selected);
+            if (Utils.isBlank(exportDocument.content()))
+            {
+                showError("Export error", "No requests were exported.");
+                return;
+            }
+            Files.writeString(
+                    outputPath,
+                    exportDocument.content(),
+                    StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.TRUNCATE_EXISTING,
+                    StandardOpenOption.WRITE
+            );
+        }
+        catch (Exception ex)
+        {
+            logError("Export failed: " + ex.getMessage(), ex);
+            showError("Export error", ex.getMessage());
+            return;
+        }
+
+        int exported = exportDocument.exported();
+        int failed = exportDocument.failed();
+        statusLabel.setText("Exported " + exported + " request(s), failed: " + failed + " -> " + outputPath);
+        log("Exported selected requests. Exported=" + exported + ", Failed=" + failed + ", File=" + outputPath);
+    }
+
+    private ExportDocument buildExportDocument(List<OpenApiParserModel.OperationContext> selected)
+    {
+        if (selected == null || selected.isEmpty())
+        {
+            return new ExportDocument("", 0, 0);
+        }
+
+        StringBuilder all = new StringBuilder();
+        int exported = 0;
+        int failed = 0;
+        for (OpenApiParserModel.OperationContext operation : selected)
+        {
+            HttpRequest request;
+            try
+            {
+                request = requestGenerator.generate(operation, selectedServer(), fallbackServersForOperation(operation));
+            }
+            catch (Exception ex)
+            {
+                logError("Export skipped for " + operation.method() + " " + operation.path() + ": " + ex.getMessage(), ex);
+                failed++;
+                continue;
+            }
+
+            if (exported > 0)
+            {
+                all.append("\n\n============================================================\n\n");
+            }
+
+            String server = request.url();
+            try
+            {
+                URI uri = URI.create(request.url());
+                if (Utils.nonBlank(uri.getScheme()) && Utils.nonBlank(uri.getAuthority()))
+                {
+                    server = uri.getScheme() + "://" + uri.getAuthority();
+                }
+            }
+            catch (Exception ignored)
+            {
+                // Keep full URL fallback.
+            }
+
+            all.append("Source: ").append(Utils.coalesce(operation.sourceLabel(), operation.sourceId())).append('\n');
+            all.append("Method: ").append(operation.method()).append('\n');
+            all.append("Path: ").append(operation.path()).append('\n');
+            all.append("Server: ").append(server).append('\n');
+            all.append('\n');
+            all.append("[RAW HTTP]\n");
+            all.append(request).append('\n');
+            all.append('\n');
+            all.append("[CURL]\n");
+            all.append(Utils.toCurl(request)).append('\n');
+            all.append('\n');
+            all.append("[PYTHON REQUESTS]\n");
+            all.append(Utils.toPythonRequests(request)).append('\n');
+
+            exported++;
+        }
+        return new ExportDocument(all.toString(), exported, failed);
+    }
+
     private String selectedServer()
     {
         Object selected = serverSelector.getSelectedItem();
         return selected == null ? DEFAULT_SERVER_ITEM : String.valueOf(selected);
+    }
+
+    private List<String> fallbackServersForOperation(OpenApiParserModel.OperationContext operationContext)
+    {
+        if (operationContext != null && Utils.nonBlank(operationContext.sourceId()))
+        {
+            List<String> bySource = model.availableServers(operationContext.sourceId());
+            if (bySource != null && !bySource.isEmpty())
+            {
+                return bySource;
+            }
+        }
+        return model.availableServers(selectedSourceId());
     }
 
     private String extractRequestUrl(HttpRequestResponse requestResponse)
@@ -1641,7 +2819,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         try
         {
             return requestResponse != null && requestResponse.response() != null
-                    ? requestResponse.response().bodyToString()
+                    ? decodeResponseBody(requestResponse.response())
                     : "";
         }
         catch (Exception ignored)
@@ -1671,26 +2849,90 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         }
     }
 
+    private record HttpFetchResult(
+            String url,
+            short statusCode,
+            String body)
+    {
+    }
+
+    record FetchResponse(
+            short statusCode,
+            byte[] bodyBytes,
+            String contentType,
+            long contentLength)
+    {
+    }
+
+    private record BomDecode(String charsetName, int offset)
+    {
+    }
+
+    private record ExportDocument(String content, int exported, int failed)
+    {
+    }
+
+    @FunctionalInterface
+    interface SpecFetcher
+    {
+        FetchResponse fetch(String url, long responseTimeoutMs, long perAttemptDeadlineMs, boolean followRedirects) throws Exception;
+    }
+
     private record ParseOutcome(OpenAPI openAPI, SwaggerParseResult parseResult, String sourceLabel, String sourceLocation)
     {
     }
 
-    private record ScannerQueueResult(
-            int queued,
-            int failed,
-            int outOfScope,
-            int autoIncluded,
-            String auditStatus,
-            int auditRequests,
-            int auditErrors,
-            int auditInsertionPoints)
+    private record BatchLoadResult(
+            List<ParseOutcome> outcomes,
+            List<String> failures,
+            int totalLines,
+            int acceptedUrls,
+            int normalizedUrls,
+            int skippedLines,
+            String sourceLabel,
+            int processedUrls,
+            boolean canceled)
     {
     }
 
-    private record ScopeResult(
-            boolean inScope,
-            boolean autoIncluded)
+    private record UrlListParseResult(
+            List<String> urls,
+            List<String> normalizationNotes,
+            List<String> skipNotes,
+            int totalLines,
+            int normalizedCount)
     {
+    }
+
+    private record UrlLineDecision(
+            boolean accepted,
+            String url,
+            boolean normalized,
+            String note)
+    {
+        private static UrlLineDecision skipped(String note)
+        {
+            return new UrlLineDecision(false, "", false, note);
+        }
+
+        private static UrlLineDecision accepted(String url, boolean normalized, String note)
+        {
+            return new UrlLineDecision(true, url, normalized, note);
+        }
+    }
+
+    private record SourceSelection(String id, String label)
+    {
+        private static SourceSelection allSources()
+        {
+            return new SourceSelection("", DEFAULT_SOURCE_ITEM);
+        }
+
+        @Override
+        public String toString()
+        {
+            return Utils.coalesce(label, DEFAULT_SOURCE_ITEM);
+        }
     }
 
     @FunctionalInterface

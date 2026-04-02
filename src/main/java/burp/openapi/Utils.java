@@ -5,6 +5,8 @@ import burp.api.montoya.http.message.requests.HttpRequest;
 
 import java.awt.Toolkit;
 import java.awt.datatransfer.StringSelection;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
@@ -19,6 +21,8 @@ import java.util.stream.Collectors;
  */
 public final class Utils
 {
+    private static final Charset WINDOWS_1251 = Charset.forName("windows-1251");
+
     private Utils()
     {
     }
@@ -222,6 +226,116 @@ public final class Utils
             return "-";
         }
         return server.length() <= 64 ? server : server.substring(0, 61) + "...";
+    }
+
+    public static String repairMojibake(String value)
+    {
+        if (isBlank(value))
+        {
+            return coalesce(value);
+        }
+
+        String original = value;
+        if (!looksLikeMojibake(original))
+        {
+            return original;
+        }
+
+        String best = original;
+        int bestScore = textQualityScore(best);
+
+        String cp1251ToUtf8 = new String(original.getBytes(WINDOWS_1251), StandardCharsets.UTF_8);
+        int cp1251Score = textQualityScore(cp1251ToUtf8);
+        if (cp1251Score > bestScore)
+        {
+            best = cp1251ToUtf8;
+            bestScore = cp1251Score;
+        }
+
+        String isoToUtf8 = new String(original.getBytes(StandardCharsets.ISO_8859_1), StandardCharsets.UTF_8);
+        int isoScore = textQualityScore(isoToUtf8);
+        if (isoScore > bestScore)
+        {
+            best = isoToUtf8;
+            bestScore = isoScore;
+        }
+
+        return best;
+    }
+
+    private static boolean looksLikeMojibake(String value)
+    {
+        if (isBlank(value))
+        {
+            return false;
+        }
+
+        int suspiciousPairs = 0;
+        for (int i = 0; i < value.length() - 1; i++)
+        {
+            char first = value.charAt(i);
+            char second = value.charAt(i + 1);
+            boolean cpPair = (first == 'Р' || first == 'С') && isCyrillic(second);
+            boolean latinPair = (first == 'Ð' || first == 'Ñ') && second >= '\u0080' && second <= '\u00FF';
+            if (cpPair || latinPair)
+            {
+                suspiciousPairs++;
+            }
+        }
+
+        return suspiciousPairs >= 2 || value.contains("Ã") || value.contains("�");
+    }
+
+    private static int textQualityScore(String value)
+    {
+        if (isBlank(value))
+        {
+            return Integer.MIN_VALUE / 8;
+        }
+
+        int score = 0;
+        int suspiciousPairs = 0;
+        for (int i = 0; i < value.length(); i++)
+        {
+            char ch = value.charAt(i);
+            if (isCyrillic(ch))
+            {
+                score += 4;
+            }
+            else if (Character.isLetterOrDigit(ch))
+            {
+                score += 1;
+            }
+            else if (ch == '\uFFFD')
+            {
+                score -= 10;
+            }
+
+            if (i < value.length() - 1)
+            {
+                char next = value.charAt(i + 1);
+                if ((ch == 'Р' || ch == 'С') && isCyrillic(next))
+                {
+                    suspiciousPairs++;
+                }
+                if ((ch == 'Ð' || ch == 'Ñ') && next >= '\u0080' && next <= '\u00FF')
+                {
+                    suspiciousPairs++;
+                }
+            }
+        }
+
+        score -= suspiciousPairs * 7;
+        if (value.contains("Ã"))
+        {
+            score -= 12;
+        }
+        return score;
+    }
+
+    private static boolean isCyrillic(char ch)
+    {
+        return (ch >= '\u0400' && ch <= '\u04FF') || ch == 'Ё' || ch == 'ё';
     }
 
     private static String safeBody(HttpRequest request)

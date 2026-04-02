@@ -6,6 +6,7 @@ import io.swagger.v3.oas.models.examples.Example;
 import io.swagger.v3.oas.models.media.ArraySchema;
 import io.swagger.v3.oas.models.media.ComposedSchema;
 import io.swagger.v3.oas.models.media.Content;
+import io.swagger.v3.oas.models.media.Discriminator;
 import io.swagger.v3.oas.models.media.IntegerSchema;
 import io.swagger.v3.oas.models.media.MediaType;
 import io.swagger.v3.oas.models.media.ObjectSchema;
@@ -394,6 +395,93 @@ final class RequestGeneratorTest
         assertEquals("one-of-value", oneOfRequest.bodyToString());
     }
 
+    @Test
+    void anyOfPrefersBranchWithDefaultExampleOverEmptyBranch()
+    {
+        RequestGenerator generator = new RequestGenerator();
+
+        ComposedSchema anyOf = new ComposedSchema();
+        anyOf.setAnyOf(List.of(
+                new ObjectSchema().addProperty("a", new StringSchema()),
+                new ObjectSchema().addProperty("token", new StringSchema()._default("preferred-token"))
+        ));
+
+        RequestBody requestBody = new RequestBody()
+                .content(new Content().addMediaType("application/json", new MediaType().schema(anyOf)));
+
+        OpenApiParserModel.OperationContext context = context(
+                "POST",
+                "/any-of",
+                List.of("https://api.example"),
+                List.of(),
+                requestBody,
+                new Operation()
+        );
+
+        HttpRequest request = generator.generate(context, DEFAULT_SERVER, List.of());
+        assertTrue(request.bodyToString().contains("\"token\""));
+        assertTrue(request.bodyToString().contains("preferred-token"));
+    }
+
+    @Test
+    void discriminatorIsAddedWhenMissingInComposedPayload()
+    {
+        RequestGenerator generator = new RequestGenerator();
+
+        ComposedSchema oneOf = new ComposedSchema();
+        oneOf.setOneOf(List.of(
+                new ObjectSchema().addProperty("id", new StringSchema()._default("123"))
+        ));
+        oneOf.setDiscriminator(new Discriminator().propertyName("type"));
+
+        RequestBody requestBody = new RequestBody()
+                .content(new Content().addMediaType("application/json", new MediaType().schema(oneOf)));
+
+        OpenApiParserModel.OperationContext context = context(
+                "POST",
+                "/disc",
+                List.of("https://api.example"),
+                List.of(),
+                requestBody,
+                new Operation()
+        );
+
+        HttpRequest request = generator.generate(context, DEFAULT_SERVER, List.of());
+        assertTrue(request.bodyToString().contains("\"type\""));
+    }
+
+    @Test
+    void arrayMinItemsIsHonoredAndCappedDeterministically()
+    {
+        RequestGenerator generator = new RequestGenerator();
+
+        ArraySchema tags = new ArraySchema();
+        tags.setMinItems(10);
+        tags.setItems(new StringSchema()._default("tag"));
+
+        ObjectSchema payload = new ObjectSchema();
+        payload.addProperty("tags", tags);
+        RequestBody requestBody = new RequestBody()
+                .content(new Content().addMediaType("application/json", new MediaType().schema(payload)));
+
+        OpenApiParserModel.OperationContext context = context(
+                "POST",
+                "/array",
+                List.of("https://api.example"),
+                List.of(),
+                requestBody,
+                new Operation()
+        );
+
+        HttpRequest request = generator.generate(context, DEFAULT_SERVER, List.of());
+        String body = request.bodyToString();
+        assertTrue(body.contains("\"tags\""));
+        assertTrue(body.contains("tag"));
+        int occurrences = body.split("tag", -1).length - 1;
+        assertTrue(occurrences >= 3);
+        assertTrue(occurrences <= 4); // pretty JSON adds quotes, but array count is capped to 3 items
+    }
+
     private OpenApiParserModel.OperationContext context(
             String method,
             String path,
@@ -403,6 +491,9 @@ final class RequestGeneratorTest
             Operation operation)
     {
         return new OpenApiParserModel.OperationContext(
+                "source:test",
+                "test-source",
+                "https://api.example/openapi.json",
                 method,
                 path,
                 method + " " + path,

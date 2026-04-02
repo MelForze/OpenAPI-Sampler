@@ -9,7 +9,7 @@ import burp.api.montoya.MontoyaApi;
 public final class OpenApiParserExtension implements BurpExtension
 {
     public static final String NAME = "OpenAPI Parser";
-    public static final String VERSION = "2.0.9";
+    public static final String VERSION = "2.0.12";
     public static final String AUTHOR = "MelForze";
 
     @Override

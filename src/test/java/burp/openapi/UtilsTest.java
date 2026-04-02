@@ -70,6 +70,17 @@ final class UtilsTest
     }
 
     @Test
+    void repairMojibakeRecoversCyrillicText()
+    {
+        String mojibake = "РњРµС‚РѕРґ СЃРѕР·РґР°РЅРёСЏ";
+        String repaired = Utils.repairMojibake(mojibake);
+        assertEquals("Метод создания", repaired);
+
+        String clean = "Метод создания";
+        assertEquals(clean, Utils.repairMojibake(clean));
+    }
+
+    @Test
     void curlExportIncludesUsefulHeadersAndEscapesBody()
     {
         HttpRequest request = HttpRequest.httpRequestFromUrl("https://api.example.com/v1/users?role=admin")

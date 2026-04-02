@@ -3,6 +3,7 @@ package burp.openapi;
 import javax.swing.AbstractCellEditor;
 import javax.swing.BorderFactory;
 import javax.swing.JButton;
+import javax.swing.JCheckBoxMenuItem;
 import javax.swing.JMenuItem;
 import javax.swing.JPanel;
 import javax.swing.JPopupMenu;
@@ -14,6 +15,7 @@ import javax.swing.table.DefaultTableCellRenderer;
 import javax.swing.table.TableCellEditor;
 import javax.swing.table.TableCellRenderer;
 import javax.swing.table.TableColumn;
+import javax.swing.table.TableColumnModel;
 import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.Component;
@@ -40,10 +42,14 @@ public final class OpenApiParserTable extends JPanel
 
     public enum SelectionAction
     {
+        SEND_VISIBLE_TO_REPEATER,
         SEND_SELECTED_TO_REPEATER,
         SEND_SELECTED_TO_INTRUDER,
+        SEND_SELECTED_TO_ACTIVE_SCAN,
+        SEND_SELECTED_TO_PASSIVE_SCAN,
         COPY_SELECTED_AS_CURL,
         COPY_SELECTED_AS_PYTHON,
+        EXPORT_SELECTED_REQUESTS,
         DELETE_SELECTED,
         SELECT_ALL,
         CLEAR_SELECTION
@@ -68,17 +74,18 @@ public final class OpenApiParserTable extends JPanel
     }
 
     private static final int COL_METHOD = 0;
-    private static final int COL_PATH = 1;
-    private static final int COL_SUMMARY = 2;
-    private static final int COL_PARAMS = 3;
-    private static final int COL_BODY = 4;
-    private static final int COL_TAGS = 5;
-    private static final int COL_SERVER = 6;
+    private static final int COL_SERVER = 1;
+    private static final int COL_PATH = 2;
+    private static final int COL_SUMMARY = 3;
+    private static final int COL_PARAMS = 4;
+    private static final int COL_BODY = 5;
+    private static final int COL_TAGS = 6;
     private static final int COL_CURL = 7;
     private static final int COL_PYTHON = 8;
 
     private final JTable table;
     private final OperationsTableModel model;
+    private final TableColumn[] allColumns;
     private RowActionListener listener;
     private SelectionActionListener selectionActionListener;
     private SelectionChangedListener selectionChangedListener;
@@ -104,15 +111,17 @@ public final class OpenApiParserTable extends JPanel
 
         this.table.getColumnModel().getColumn(COL_METHOD).setCellRenderer(new MethodCellRenderer());
         this.table.getColumnModel().getColumn(COL_METHOD).setPreferredWidth(78);
+        this.table.getColumnModel().getColumn(COL_SERVER).setPreferredWidth(220);
         this.table.getColumnModel().getColumn(COL_PATH).setPreferredWidth(280);
         this.table.getColumnModel().getColumn(COL_SUMMARY).setPreferredWidth(240);
         this.table.getColumnModel().getColumn(COL_PARAMS).setPreferredWidth(260);
         this.table.getColumnModel().getColumn(COL_BODY).setPreferredWidth(220);
         this.table.getColumnModel().getColumn(COL_TAGS).setPreferredWidth(170);
-        this.table.getColumnModel().getColumn(COL_SERVER).setPreferredWidth(220);
 
         installActionColumn(COL_CURL, "Copy cURL", RowAction.COPY_AS_CURL);
         installActionColumn(COL_PYTHON, "Copy Python", RowAction.COPY_AS_PYTHON);
+        this.allColumns = captureColumnsByModelIndex();
+        installHeaderContextMenu();
         installContextMenu();
 
         add(new javax.swing.JScrollPane(table), BorderLayout.CENTER);
@@ -199,6 +208,136 @@ public final class OpenApiParserTable extends JPanel
         column.setMinWidth(94);
     }
 
+    private TableColumn[] captureColumnsByModelIndex()
+    {
+        TableColumn[] columns = new TableColumn[model.getColumnCount()];
+        TableColumnModel columnModel = table.getColumnModel();
+        for (int viewIndex = 0; viewIndex < columnModel.getColumnCount(); viewIndex++)
+        {
+            TableColumn column = columnModel.getColumn(viewIndex);
+            int modelIndex = column.getModelIndex();
+            if (modelIndex >= 0 && modelIndex < columns.length)
+            {
+                columns[modelIndex] = column;
+            }
+        }
+        return columns;
+    }
+
+    private void installHeaderContextMenu()
+    {
+        table.getTableHeader().addMouseListener(new MouseAdapter()
+        {
+            @Override
+            public void mousePressed(MouseEvent e)
+            {
+                maybeShowHeaderPopup(e);
+            }
+
+            @Override
+            public void mouseReleased(MouseEvent e)
+            {
+                maybeShowHeaderPopup(e);
+            }
+
+            private void maybeShowHeaderPopup(MouseEvent e)
+            {
+                if (!e.isPopupTrigger())
+                {
+                    return;
+                }
+
+                buildHeaderPopupMenu().show(e.getComponent(), e.getX(), e.getY());
+            }
+        });
+    }
+
+    private JPopupMenu buildHeaderPopupMenu()
+    {
+        JPopupMenu menu = new JPopupMenu();
+        int visibleCount = table.getColumnModel().getColumnCount();
+        for (int modelIndex = 0; modelIndex < model.getColumnCount(); modelIndex++)
+        {
+            final int columnIndex = modelIndex;
+            boolean visible = isColumnVisible(columnIndex);
+            String title = model.getColumnName(columnIndex);
+            JCheckBoxMenuItem item = new JCheckBoxMenuItem(title, visible);
+            if (visible && visibleCount <= 1)
+            {
+                item.setEnabled(false);
+            }
+            item.addActionListener(e -> {
+                boolean shouldBeVisible = item.isSelected();
+                setColumnVisible(columnIndex, shouldBeVisible);
+            });
+            menu.add(item);
+        }
+        return menu;
+    }
+
+    private boolean isColumnVisible(int modelIndex)
+    {
+        return table.convertColumnIndexToView(modelIndex) >= 0;
+    }
+
+    private void setColumnVisible(int modelIndex, boolean visible)
+    {
+        if (modelIndex < 0 || modelIndex >= allColumns.length)
+        {
+            return;
+        }
+
+        TableColumnModel columnModel = table.getColumnModel();
+        int viewIndex = table.convertColumnIndexToView(modelIndex);
+        if (visible)
+        {
+            if (viewIndex >= 0)
+            {
+                return;
+            }
+            TableColumn column = allColumns[modelIndex];
+            if (column == null)
+            {
+                return;
+            }
+            columnModel.addColumn(column);
+            moveColumnToCanonicalPosition(modelIndex);
+            return;
+        }
+
+        if (viewIndex < 0 || columnModel.getColumnCount() <= 1)
+        {
+            return;
+        }
+
+        TableColumn column = columnModel.getColumn(viewIndex);
+        columnModel.removeColumn(column);
+    }
+
+    private void moveColumnToCanonicalPosition(int modelIndex)
+    {
+        TableColumnModel columnModel = table.getColumnModel();
+        int currentViewIndex = table.convertColumnIndexToView(modelIndex);
+        if (currentViewIndex < 0)
+        {
+            return;
+        }
+
+        int targetViewIndex = 0;
+        for (int index = 0; index < modelIndex; index++)
+        {
+            if (table.convertColumnIndexToView(index) >= 0)
+            {
+                targetViewIndex++;
+            }
+        }
+
+        if (currentViewIndex != targetViewIndex)
+        {
+            columnModel.moveColumn(currentViewIndex, targetViewIndex);
+        }
+    }
+
     private void installContextMenu()
     {
         table.addMouseListener(new MouseAdapter()
@@ -251,11 +390,16 @@ public final class OpenApiParserTable extends JPanel
         boolean hasSelection = !selected.isEmpty() || popupAnchorOperation != null;
 
         JPopupMenu menu = new JPopupMenu();
+        addPopupItem(menu, "Send all visible to Repeater", SelectionAction.SEND_VISIBLE_TO_REPEATER, table.getRowCount() > 0);
+        menu.addSeparator();
         addPopupItem(menu, "Send selected to Repeater", SelectionAction.SEND_SELECTED_TO_REPEATER, hasSelection);
         addPopupItem(menu, "Send selected to Intruder", SelectionAction.SEND_SELECTED_TO_INTRUDER, hasSelection);
+        addPopupItem(menu, "Send selected to Active scan", SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN, hasSelection);
+        addPopupItem(menu, "Send selected to Passive scan", SelectionAction.SEND_SELECTED_TO_PASSIVE_SCAN, hasSelection);
         menu.addSeparator();
         addPopupItem(menu, "Copy selected as cURL", SelectionAction.COPY_SELECTED_AS_CURL, hasSelection);
         addPopupItem(menu, "Copy selected as Python-Requests", SelectionAction.COPY_SELECTED_AS_PYTHON, hasSelection);
+        addPopupItem(menu, "Export selected requests...", SelectionAction.EXPORT_SELECTED_REQUESTS, hasSelection);
         menu.addSeparator();
         addPopupItem(menu, "Delete selected rows", SelectionAction.DELETE_SELECTED, hasSelection);
         menu.addSeparator();
@@ -280,7 +424,9 @@ public final class OpenApiParserTable extends JPanel
         }
 
         List<OpenApiParserModel.OperationContext> payload;
-        if (action == SelectionAction.SELECT_ALL || action == SelectionAction.CLEAR_SELECTION)
+        if (action == SelectionAction.SELECT_ALL
+                || action == SelectionAction.CLEAR_SELECTION
+                || action == SelectionAction.SEND_VISIBLE_TO_REPEATER)
         {
             payload = List.of();
         }
@@ -434,12 +580,12 @@ public final class OpenApiParserTable extends JPanel
     {
         private static final String[] COLUMNS = {
                 "Method",
+                "Server",
                 "Path",
                 "Summary / OperationId",
                 "Parameters",
                 "Request body",
                 "Tags",
-                "Server",
                 "Copy as curl",
                 "Copy as Python"
         };
