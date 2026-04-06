@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<extensions>
+  <extension>
+    <name>OpenAPI Sampler</name>
+    <version>2.0.13</version>
+    <author>MelForze</author>
+    <entryPoint>burp.openapi.OpenApiSamplerExtension</entryPoint>
+    <extensionType>java</extensionType>
+    <minimumBurpVersion>2025.1</minimumBurpVersion>
+    <minimumJavaVersion>17</minimumJavaVersion>
+    <minimumMontoyaVersion>2026.2</minimumMontoyaVersion>
+    <repositoryUrl>https://github.com/MelForze/OpenAPI-Sampler</repositoryUrl>
+    <iconPath>assets/openapi-sampler-icon.svg</iconPath>
+    <shortDescription>
+      OpenAPI Sampler for Burp with OpenAPI 3.1 support, discriminator-aware examples, and export/replay actions.
+    </shortDescription>
+    <longDescription>
+      OpenAPI Sampler loads OpenAPI 2.0/3.0/3.1 specs from local files, URL lists, remote URLs,
+      and Target context menu entries. It builds schema-aware requests, supports repeat sending to
+      Burp tools, and exports requests in multiple formats.
+    </longDescription>
+  </extension>
+</extensions>

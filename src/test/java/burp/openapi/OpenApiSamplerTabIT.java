@@ -19,7 +19,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
-final class OpenApiParserTabIT
+final class OpenApiSamplerTabIT
 {
     @BeforeAll
     static void setupMontoyaFactory()
@@ -39,7 +39,7 @@ final class OpenApiParserTabIT
                     .setBody(minimalSpec("Recovered")));
             server.start();
 
-            OpenApiParserTab tab = new OpenApiParserTab(TestApiFactory.apiContext().api, testHttpFetcher());
+            OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api, testHttpFetcher());
             Object parseOutcome = invoke(tab, "fetchAndParseFromUrl", new Class<?>[]{String.class}, server.url("/openapi.json").toString());
             OpenAPI openAPI = (OpenAPI) recordValue(parseOutcome, "openAPI");
 
@@ -60,7 +60,7 @@ final class OpenApiParserTabIT
                     .setBody(minimalSpec("Recovered429")));
             server.start();
 
-            OpenApiParserTab tab = new OpenApiParserTab(TestApiFactory.apiContext().api, testHttpFetcher());
+            OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api, testHttpFetcher());
             Object parseOutcome = invoke(tab, "fetchAndParseFromUrl", new Class<?>[]{String.class}, server.url("/openapi.json").toString());
             OpenAPI openAPI = (OpenAPI) recordValue(parseOutcome, "openAPI");
 
@@ -83,7 +83,7 @@ final class OpenApiParserTabIT
                     .setBody(minimalSpec("Redirected")));
             server.start();
 
-            OpenApiParserTab tab = new OpenApiParserTab(TestApiFactory.apiContext().api, testHttpFetcher());
+            OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api, testHttpFetcher());
             Object parseOutcome = invoke(tab, "fetchAndParseFromUrl", new Class<?>[]{String.class}, server.url("/swagger/index.html").toString());
             OpenAPI openAPI = (OpenAPI) recordValue(parseOutcome, "openAPI");
 
@@ -106,7 +106,7 @@ final class OpenApiParserTabIT
                     .setBody(hugePayload));
             server.start();
 
-            OpenApiParserTab tab = new OpenApiParserTab(TestApiFactory.apiContext().api, testHttpFetcher());
+            OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api, testHttpFetcher());
             try
             {
                 invoke(tab, "fetchAndParseFromUrl", new Class<?>[]{String.class}, server.url("/openapi.json").toString());
@@ -145,7 +145,7 @@ final class OpenApiParserTabIT
                     .setBody(new okio.Buffer().write(spec.getBytes(Charset.forName("windows-1251")))));
             server.start();
 
-            OpenApiParserTab tab = new OpenApiParserTab(TestApiFactory.apiContext().api, testHttpFetcher());
+            OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api, testHttpFetcher());
             Object parseOutcome = invoke(tab, "fetchAndParseFromUrl", new Class<?>[]{String.class}, server.url("/openapi.json").toString());
             OpenAPI openAPI = (OpenAPI) recordValue(parseOutcome, "openAPI");
 
@@ -154,7 +154,7 @@ final class OpenApiParserTabIT
         }
     }
 
-    private OpenApiParserTab.SpecFetcher testHttpFetcher()
+    private OpenApiSamplerTab.SpecFetcher testHttpFetcher()
     {
         return (url, responseTimeoutMs, perAttemptDeadlineMs, followRedirects) -> {
             long requestTimeoutMs = Math.max(1_000L, Math.min(perAttemptDeadlineMs, responseTimeoutMs));
@@ -176,7 +176,7 @@ final class OpenApiParserTabIT
                     .map(this::parseLongSafely)
                     .orElse((long) (response.body() == null ? 0 : response.body().length));
 
-            return new OpenApiParserTab.FetchResponse(
+            return new OpenApiSamplerTab.FetchResponse(
                     (short) response.statusCode(),
                     response.body(),
                     contentType,

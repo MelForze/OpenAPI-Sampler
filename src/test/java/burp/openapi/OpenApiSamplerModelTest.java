@@ -26,12 +26,12 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-final class OpenApiParserModelTest
+final class OpenApiSamplerModelTest
 {
     @Test
     void loadMergesOperationsAcrossSpecsWithoutDuplicates()
     {
-        OpenApiParserModel model = new OpenApiParserModel();
+        OpenApiSamplerModel model = new OpenApiSamplerModel();
         OpenAPI users = singleGetSpec("https://api.one.test", "/users", "usersList", "List users");
         OpenAPI orders = singleGetSpec("https://api.two.test", "/orders", "ordersList", "List orders");
 
@@ -48,7 +48,7 @@ final class OpenApiParserModelTest
     @Test
     void filterSupportsServerSelectionAndTextFields()
     {
-        OpenApiParserModel model = new OpenApiParserModel();
+        OpenApiSamplerModel model = new OpenApiSamplerModel();
 
         Operation userOperation = new Operation()
                 .operationId("usersList")
@@ -89,7 +89,7 @@ final class OpenApiParserModelTest
     @Test
     void dedupeIsScopedPerSourceAndSameOperationInDifferentSourcesIsPreserved()
     {
-        OpenApiParserModel model = new OpenApiParserModel();
+        OpenApiSamplerModel model = new OpenApiSamplerModel();
         OpenAPI users = singleGetSpec("https://api.one.test", "/users", "usersList", "List users");
 
         model.load(users, "https://api.one.test/openapi.json", "one");
@@ -110,7 +110,7 @@ final class OpenApiParserModelTest
     @Test
     void filterSupportsSourceIsolationAndSourceScopedServers()
     {
-        OpenApiParserModel model = new OpenApiParserModel();
+        OpenApiSamplerModel model = new OpenApiSamplerModel();
         model.load(singleGetSpec("https://api.one.test", "/users", "users", "Users"), "https://api.one.test/openapi.json", "one");
         model.load(singleGetSpec("https://api.two.test", "/orders", "orders", "Orders"), "https://api.two.test/openapi.json", "two");
 
@@ -127,7 +127,7 @@ final class OpenApiParserModelTest
     @Test
     void loadResolvesServerVariablesAndRelativeUrls()
     {
-        OpenApiParserModel model = new OpenApiParserModel();
+        OpenApiSamplerModel model = new OpenApiSamplerModel();
         ServerVariables variables = new ServerVariables();
         variables.addServerVariable("env", new io.swagger.v3.oas.models.servers.ServerVariable()._default("prod"));
         variables.addServerVariable("version", new io.swagger.v3.oas.models.servers.ServerVariable()._enum(List.of("v1", "v2")));
@@ -152,7 +152,7 @@ final class OpenApiParserModelTest
     @Test
     void operationsAreExpandedPerServerWhenMultipleServersAreAvailable()
     {
-        OpenApiParserModel model = new OpenApiParserModel();
+        OpenApiSamplerModel model = new OpenApiSamplerModel();
 
         OpenAPI openAPI = new OpenAPI()
                 .servers(List.of(
@@ -171,7 +171,7 @@ final class OpenApiParserModelTest
     @Test
     void loadFallsBackToSourceHostWhenNoServerDefined()
     {
-        OpenApiParserModel model = new OpenApiParserModel();
+        OpenApiSamplerModel model = new OpenApiSamplerModel();
 
         OpenAPI openAPI = new OpenAPI();
         openAPI.setPaths(new Paths().addPathItem("/health", new PathItem().get(new Operation().summary("Health"))));
@@ -185,7 +185,7 @@ final class OpenApiParserModelTest
     @Test
     void operationServerOverridesPathAndGlobalServers()
     {
-        OpenApiParserModel model = new OpenApiParserModel();
+        OpenApiSamplerModel model = new OpenApiSamplerModel();
 
         PathItem pathItem = new PathItem();
         pathItem.setServers(List.of(new Server().url("https://path.example")));
@@ -200,14 +200,14 @@ final class OpenApiParserModelTest
 
         model.load(openAPI, "https://global.example/openapi.json");
 
-        OpenApiParserModel.OperationContext context = model.operations().get(0);
+        OpenApiSamplerModel.OperationContext context = model.operations().get(0);
         assertEquals(List.of("https://operation.example"), context.servers());
     }
 
     @Test
     void summaryTextIsRepairedWhenMojibakeDetected()
     {
-        OpenApiParserModel model = new OpenApiParserModel();
+        OpenApiSamplerModel model = new OpenApiSamplerModel();
 
         OpenAPI openAPI = new OpenAPI()
                 .servers(List.of(new Server().url("https://api.example")))
@@ -224,7 +224,7 @@ final class OpenApiParserModelTest
     @Test
     void pathParametersAreMergedAndOperationOverridesPathParameter()
     {
-        OpenApiParserModel model = new OpenApiParserModel();
+        OpenApiSamplerModel model = new OpenApiSamplerModel();
 
         Parameter pathLevelId = new Parameter().name("id").in("path").example("from-path");
         Parameter operationLevelId = new Parameter().name("id").in("path").example("from-operation");
@@ -245,7 +245,7 @@ final class OpenApiParserModelTest
 
         model.load(openAPI, "https://api.example/openapi.json");
 
-        OpenApiParserModel.OperationContext context = model.operations().get(0);
+        OpenApiSamplerModel.OperationContext context = model.operations().get(0);
         assertEquals(2, context.parameters().size());
         Map<String, String> paramValues = new LinkedHashMap<>();
         for (Parameter parameter : context.parameters())
@@ -272,7 +272,7 @@ final class OpenApiParserModelTest
                 new Parameter().in("header").name("x-id")
         );
 
-        OpenApiParserModel.OperationContext context = new OpenApiParserModel.OperationContext(
+        OpenApiSamplerModel.OperationContext context = new OpenApiSamplerModel.OperationContext(
                 "source:test",
                 "test-source",
                 "https://api.example/openapi.json",
@@ -303,7 +303,7 @@ final class OpenApiParserModelTest
                 new Parameter().in("formData").name("file")
         );
 
-        OpenApiParserModel.OperationContext context = new OpenApiParserModel.OperationContext(
+        OpenApiSamplerModel.OperationContext context = new OpenApiSamplerModel.OperationContext(
                 "source:test",
                 "test-source",
                 "https://api.example/openapi.json",
@@ -324,7 +324,7 @@ final class OpenApiParserModelTest
     @Test
     void preferredServerSelectionWorks()
     {
-        OpenApiParserModel.OperationContext context = new OpenApiParserModel.OperationContext(
+        OpenApiSamplerModel.OperationContext context = new OpenApiSamplerModel.OperationContext(
                 "source:test",
                 "test-source",
                 "https://api.example/openapi.json",
@@ -341,7 +341,7 @@ final class OpenApiParserModelTest
 
         assertEquals("https://selected-server", context.preferredServer(List.of("https://global"), "https://selected-server"));
         assertEquals("https://operation-server", context.preferredServer(List.of("https://global"), "(Operation default)"));
-        assertEquals("https://global", new OpenApiParserModel.OperationContext(
+        assertEquals("https://global", new OpenApiSamplerModel.OperationContext(
                 "source:test",
                 "test-source",
                 "https://api.example/openapi.json",
@@ -352,7 +352,7 @@ final class OpenApiParserModelTest
     @Test
     void removeOperationsAndClearResetState()
     {
-        OpenApiParserModel model = new OpenApiParserModel();
+        OpenApiSamplerModel model = new OpenApiSamplerModel();
         OpenAPI openAPI = new OpenAPI()
                 .servers(List.of(new Server().url("https://api.example")))
                 .paths(new Paths()
@@ -376,7 +376,7 @@ final class OpenApiParserModelTest
     @Test
     void operationsAreSortedByPathThenMethod()
     {
-        OpenApiParserModel model = new OpenApiParserModel();
+        OpenApiSamplerModel model = new OpenApiSamplerModel();
         Paths paths = new Paths();
 
         PathItem zPath = new PathItem();
@@ -391,7 +391,7 @@ final class OpenApiParserModelTest
 
         model.load(new OpenAPI().servers(List.of(new Server().url("https://api.example"))).paths(paths), "https://api.example/openapi.json");
 
-        List<OpenApiParserModel.OperationContext> operations = model.operations();
+        List<OpenApiSamplerModel.OperationContext> operations = model.operations();
         assertEquals("/a", operations.get(0).path());
         assertEquals("GET", operations.get(0).method());
         assertEquals("/a", operations.get(1).path());
@@ -403,7 +403,7 @@ final class OpenApiParserModelTest
     @Test
     void filterByServerIgnoresOperationDefaultPseudoValue()
     {
-        OpenApiParserModel model = new OpenApiParserModel();
+        OpenApiSamplerModel model = new OpenApiSamplerModel();
         model.load(singleGetSpec("https://api.example", "/users", "users", "Users"), "https://api.example/openapi.json");
 
         assertEquals(1, model.filter("", "(Operation default)").size());

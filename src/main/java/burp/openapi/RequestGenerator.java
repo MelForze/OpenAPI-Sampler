@@ -37,7 +37,7 @@ public final class RequestGenerator
     private static final int MAX_ARRAY_EXAMPLES = 3;
 
     public HttpRequest generate(
-            OpenApiParserModel.OperationContext operationContext,
+            OpenApiSamplerModel.OperationContext operationContext,
             String selectedServer,
             Collection<String> globalServers)
     {
@@ -281,7 +281,7 @@ public final class RequestGenerator
 
         if (lowerMediaType.contains("multipart/form-data"))
         {
-            String boundary = "----OpenApiParserBoundary";
+            String boundary = "----OpenApiSamplerBoundary";
             String multipartBody = toMultipart(payloadObject, boundary);
             return new BodyPayload(mediaType + "; boundary=" + boundary, multipartBody);
         }

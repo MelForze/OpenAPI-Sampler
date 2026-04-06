@@ -26,6 +26,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
 
@@ -43,7 +44,7 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-final class OpenApiParserTabTest
+final class OpenApiSamplerTabTest
 {
     @BeforeAll
     static void setupMontoyaFactory()
@@ -54,15 +55,15 @@ final class OpenApiParserTabTest
     @Test
     void basicTabMetadataAndComponentExist()
     {
-        OpenApiParserTab tab = new OpenApiParserTab(TestApiFactory.apiContext().api);
-        assertEquals("OpenAPI Parser", tab.tabTitle());
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
+        assertEquals("OpenAPI Sampler", tab.tabTitle());
         assertNotNull(tab.uiComponent());
     }
 
     @Test
     void provideMenuItemsReturnsEmptyForIrrelevantEvents()
     {
-        OpenApiParserTab tab = new OpenApiParserTab(TestApiFactory.apiContext().api);
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
         assertTrue(tab.provideMenuItems((ContextMenuEvent) null).isEmpty());
 
         ContextMenuEvent event = mock(ContextMenuEvent.class);
@@ -73,7 +74,7 @@ final class OpenApiParserTabTest
     @Test
     void provideMenuItemsDetectsOpenApiUrlAndBody()
     {
-        OpenApiParserTab tab = new OpenApiParserTab(TestApiFactory.apiContext().api);
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
 
         HttpRequestResponse urlResponse = mock(HttpRequestResponse.class);
         HttpRequest request = mock(HttpRequest.class);
@@ -109,7 +110,7 @@ final class OpenApiParserTabTest
     @Test
     void parseSpecAcceptsValidInputAndRejectsInvalidInput() throws Exception
     {
-        OpenApiParserTab tab = new OpenApiParserTab(TestApiFactory.apiContext().api);
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
 
         String valid = """
                 openapi: 3.0.3
@@ -148,7 +149,7 @@ final class OpenApiParserTabTest
     @Test
     void urlListParsingHelpersWork() throws Exception
     {
-        OpenApiParserTab tab = new OpenApiParserTab(TestApiFactory.apiContext().api);
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
 
         String normalizedQuoted = (String) invoke(tab, "normalizeToken", new Class<?>[]{String.class}, "\"api.example/openapi.json\"");
         assertEquals("api.example/openapi.json", normalizedQuoted);
@@ -170,7 +171,7 @@ final class OpenApiParserTabTest
     @Test
     void formatParseErrorsProvidesFallbackText() throws Exception
     {
-        OpenApiParserTab tab = new OpenApiParserTab(TestApiFactory.apiContext().api);
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
 
         String fromNull = (String) invoke(tab, "formatParseErrors", new Class<?>[]{SwaggerParseResult.class}, (Object) null);
         assertTrue(fromNull.contains("no model"));
@@ -184,10 +185,10 @@ final class OpenApiParserTabTest
     @Test
     void selectedServerFiltersVisibleRows() throws Exception
     {
-        OpenApiParserTab tab = new OpenApiParserTab(TestApiFactory.apiContext().api);
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
 
-        OpenApiParserModel model = (OpenApiParserModel) field(tab, "model");
-        OpenApiParserTable table = (OpenApiParserTable) field(tab, "table");
+        OpenApiSamplerModel model = (OpenApiSamplerModel) field(tab, "model");
+        OpenApiSamplerTable table = (OpenApiSamplerTable) field(tab, "table");
         @SuppressWarnings("unchecked")
         JComboBox<?> sourceSelector = (JComboBox<?>) field(tab, "sourceSelector");
         @SuppressWarnings("unchecked")
@@ -216,7 +217,7 @@ final class OpenApiParserTabTest
     @Test
     void extractHelpersReturnSafeDefaultsWhenDataMissing() throws Exception
     {
-        OpenApiParserTab tab = new OpenApiParserTab(TestApiFactory.apiContext().api);
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
 
         HttpRequestResponse requestResponse = mock(HttpRequestResponse.class);
         when(requestResponse.request()).thenReturn(null);
@@ -236,7 +237,7 @@ final class OpenApiParserTabTest
     void uiStateIsPersistedAndRestored() throws Exception
     {
         TestApiFactory.ApiContext ctx = TestApiFactory.apiContext();
-        OpenApiParserTab first = new OpenApiParserTab(ctx.api);
+        OpenApiSamplerTab first = new OpenApiSamplerTab(ctx.api);
 
         JTextField urlField = (JTextField) field(first, "urlField");
         JTextField filterField = (JTextField) field(first, "filterField");
@@ -251,7 +252,7 @@ final class OpenApiParserTabTest
         assertEquals("users", ctx.extensionData.getString("ui.filterField"));
         assertEquals("", ctx.extensionData.getString("ui.source"));
 
-        OpenApiParserTab restored = new OpenApiParserTab(ctx.api);
+        OpenApiSamplerTab restored = new OpenApiSamplerTab(ctx.api);
         JTextField restoredUrl = (JTextField) field(restored, "urlField");
         JTextField restoredFilter = (JTextField) field(restored, "filterField");
 
@@ -263,8 +264,8 @@ final class OpenApiParserTabTest
     void exportDocumentIncludesSourceAndAllFormats() throws Exception
     {
         TestApiFactory.ApiContext ctx = TestApiFactory.apiContext();
-        OpenApiParserTab tab = new OpenApiParserTab(ctx.api);
-        OpenApiParserModel model = (OpenApiParserModel) field(tab, "model");
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(ctx.api);
+        OpenApiSamplerModel model = (OpenApiSamplerModel) field(tab, "model");
         model.load(spec("https://export.example", "/users"), "https://export.example/openapi.json", "export-source");
 
         invoke(tab, "refreshSourceSelector", new Class<?>[]{});
@@ -289,7 +290,7 @@ final class OpenApiParserTabTest
     @Test
     void retryableFetchErrorDetectionWorks() throws Exception
     {
-        OpenApiParserTab tab = new OpenApiParserTab(TestApiFactory.apiContext().api);
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
 
         boolean timeout = (boolean) invoke(tab, "isRetryableFetchError", new Class<?>[]{IOException.class}, new IOException("connection timeout"));
         boolean tooMany = (boolean) invoke(tab, "isRetryableFetchError", new Class<?>[]{IOException.class}, new IOException("HTTP 429 returned"));
@@ -305,7 +306,7 @@ final class OpenApiParserTabTest
     @Test
     void bestDecodedCandidatePrefersReadableCyrillicText() throws Exception
     {
-        OpenApiParserTab tab = new OpenApiParserTab(TestApiFactory.apiContext().api);
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
         String mojibake = "ÐÑÐ¸Ð²ÐµÑ";
         String readable = "Привет";
 
@@ -324,7 +325,7 @@ final class OpenApiParserTabTest
     @Test
     void decodeScorePenalizesCp1251Utf8MojibakePattern() throws Exception
     {
-        OpenApiParserTab tab = new OpenApiParserTab(TestApiFactory.apiContext().api);
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
         String mojibake = "РџСЂРёРІРµС‚";
         String readable = "Привет";
 
@@ -337,7 +338,7 @@ final class OpenApiParserTabTest
     @Test
     void readSpecFileContentHandlesWindows1251RussianSummary() throws Exception
     {
-        OpenApiParserTab tab = new OpenApiParserTab(TestApiFactory.apiContext().api);
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
         Path file = Files.createTempFile("openapi-ru-", ".json");
         try
         {
@@ -357,7 +358,7 @@ final class OpenApiParserTabTest
     void autoIncludeSpecHostInScopeIncludesWhenMissingAndSkipsWhenAlreadyInScope() throws Exception
     {
         TestApiFactory.ApiContext ctx = TestApiFactory.apiContext();
-        OpenApiParserTab tab = new OpenApiParserTab(ctx.api);
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(ctx.api);
 
         when(ctx.scope.isInScope("https://api.example/")).thenReturn(false);
         invoke(tab, "autoIncludeSpecHostInScope", new Class<?>[]{String.class}, "https://api.example/openapi.json");
@@ -374,7 +375,7 @@ final class OpenApiParserTabTest
     @Test
     void urlListLineParsingSupportsCommentsCsvAndBareHosts() throws Exception
     {
-        OpenApiParserTab tab = new OpenApiParserTab(TestApiFactory.apiContext().api);
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
 
         Object blank = invoke(tab, "parseUrlLine", new Class<?>[]{String.class}, "   ");
         assertFalse((Boolean) recordValue(blank, "accepted"));
@@ -404,7 +405,7 @@ final class OpenApiParserTabTest
     @Test
     void urlListBatchParsingDeduplicatesAndCounts() throws Exception
     {
-        OpenApiParserTab tab = new OpenApiParserTab(TestApiFactory.apiContext().api);
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
         @SuppressWarnings("unchecked")
         Object parsed = invoke(tab, "parseUrlList", new Class<?>[]{List.class}, List.of(
                 "",
@@ -430,7 +431,7 @@ final class OpenApiParserTabTest
     @Test
     void buildCandidateSpecUrlsAddsSwaggerFallbackEndpoints() throws Exception
     {
-        OpenApiParserTab tab = new OpenApiParserTab(TestApiFactory.apiContext().api);
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
 
         @SuppressWarnings("unchecked")
         List<String> candidates = (List<String>) invoke(
@@ -450,7 +451,7 @@ final class OpenApiParserTabTest
     @Test
     void buildCandidateSpecUrlsReadsQueryUrlAndConfigUrl() throws Exception
     {
-        OpenApiParserTab tab = new OpenApiParserTab(TestApiFactory.apiContext().api);
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
 
         @SuppressWarnings("unchecked")
         List<String> candidates = (List<String>) invoke(
@@ -467,7 +468,7 @@ final class OpenApiParserTabTest
     @Test
     void extractReferencedUrlsFindsSwaggerUiUrlFields() throws Exception
     {
-        OpenApiParserTab tab = new OpenApiParserTab(TestApiFactory.apiContext().api);
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
 
         String html = """
                 <script>
@@ -497,8 +498,8 @@ final class OpenApiParserTabTest
     void sendAllVisibleActionQueuesAllVisibleRowsToRepeater() throws Exception
     {
         TestApiFactory.ApiContext ctx = TestApiFactory.apiContext();
-        OpenApiParserTab tab = new OpenApiParserTab(ctx.api);
-        OpenApiParserModel model = (OpenApiParserModel) field(tab, "model");
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(ctx.api);
+        OpenApiSamplerModel model = (OpenApiSamplerModel) field(tab, "model");
 
         model.load(spec("https://one.example", "/users"), "https://one.example/openapi.json");
         model.load(spec("https://two.example", "/orders"), "https://two.example/openapi.json");
@@ -508,21 +509,21 @@ final class OpenApiParserTabTest
         invoke(
                 tab,
                 "onSelectionAction",
-                new Class<?>[]{OpenApiParserTable.SelectionAction.class, List.class},
-                OpenApiParserTable.SelectionAction.SEND_VISIBLE_TO_REPEATER,
+                new Class<?>[]{OpenApiSamplerTable.SelectionAction.class, List.class},
+                OpenApiSamplerTable.SelectionAction.SEND_VISIBLE_TO_REPEATER,
                 List.of()
         );
 
         Repeater repeater = ctx.repeater;
-        verify(repeater, times(2)).sendToRepeater(any(HttpRequest.class), contains("OpenAPI Parser / All /"));
+        verify(repeater, times(2)).sendToRepeater(any(HttpRequest.class), contains("OpenAPI Sampler / All /"));
     }
 
     @Test
     void activeScanTaskIsCreatedOnceAndReusedOnSecondSend() throws Exception
     {
         TestApiFactory.ApiContext ctx = TestApiFactory.apiContext();
-        OpenApiParserTab tab = new OpenApiParserTab(ctx.api);
-        OpenApiParserModel model = (OpenApiParserModel) field(tab, "model");
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(ctx.api);
+        OpenApiSamplerModel model = (OpenApiSamplerModel) field(tab, "model");
         model.load(spec("https://scan.example", "/users"), "https://scan.example/openapi.json");
 
         Audit audit = mock(Audit.class);
@@ -538,15 +539,15 @@ final class OpenApiParserTabTest
         invoke(
                 tab,
                 "onSelectionAction",
-                new Class<?>[]{OpenApiParserTable.SelectionAction.class, List.class},
-                OpenApiParserTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
+                new Class<?>[]{OpenApiSamplerTable.SelectionAction.class, List.class},
+                OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
                 List.of(model.operations().get(0))
         );
         invoke(
                 tab,
                 "onSelectionAction",
-                new Class<?>[]{OpenApiParserTable.SelectionAction.class, List.class},
-                OpenApiParserTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
+                new Class<?>[]{OpenApiSamplerTable.SelectionAction.class, List.class},
+                OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
                 List.of(model.operations().get(0))
         );
 
@@ -559,8 +560,8 @@ final class OpenApiParserTabTest
     void activeScanTaskIsRecreatedWhenCachedTaskIsUnavailableBeforeQueue() throws Exception
     {
         TestApiFactory.ApiContext ctx = TestApiFactory.apiContext();
-        OpenApiParserTab tab = new OpenApiParserTab(ctx.api);
-        OpenApiParserModel model = (OpenApiParserModel) field(tab, "model");
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(ctx.api);
+        OpenApiSamplerModel model = (OpenApiSamplerModel) field(tab, "model");
         model.load(spec("https://scan.example", "/users"), "https://scan.example/openapi.json");
 
         Audit firstAudit = mock(Audit.class);
@@ -584,8 +585,8 @@ final class OpenApiParserTabTest
         invoke(
                 tab,
                 "onSelectionAction",
-                new Class<?>[]{OpenApiParserTable.SelectionAction.class, List.class},
-                OpenApiParserTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
+                new Class<?>[]{OpenApiSamplerTable.SelectionAction.class, List.class},
+                OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
                 List.of(model.operations().get(0))
         );
         assertTrue(firstLatch.await(2, TimeUnit.SECONDS));
@@ -593,8 +594,8 @@ final class OpenApiParserTabTest
         invoke(
                 tab,
                 "onSelectionAction",
-                new Class<?>[]{OpenApiParserTable.SelectionAction.class, List.class},
-                OpenApiParserTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
+                new Class<?>[]{OpenApiSamplerTable.SelectionAction.class, List.class},
+                OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
                 List.of(model.operations().get(0))
         );
 
@@ -608,8 +609,8 @@ final class OpenApiParserTabTest
     void addRequestFailureWithUnavailableTaskRecreatesAndRetries() throws Exception
     {
         TestApiFactory.ApiContext ctx = TestApiFactory.apiContext();
-        OpenApiParserTab tab = new OpenApiParserTab(ctx.api);
-        OpenApiParserModel model = (OpenApiParserModel) field(tab, "model");
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(ctx.api);
+        OpenApiSamplerModel model = (OpenApiSamplerModel) field(tab, "model");
         model.load(spec("https://scan.example", "/users"), "https://scan.example/openapi.json");
 
         Audit firstAudit = mock(Audit.class);
@@ -629,8 +630,8 @@ final class OpenApiParserTabTest
         invoke(
                 tab,
                 "onSelectionAction",
-                new Class<?>[]{OpenApiParserTable.SelectionAction.class, List.class},
-                OpenApiParserTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
+                new Class<?>[]{OpenApiSamplerTable.SelectionAction.class, List.class},
+                OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
                 List.of(model.operations().get(0))
         );
 
@@ -645,8 +646,8 @@ final class OpenApiParserTabTest
     void addRequestFailureWithUsableTaskDoesNotRecreateAndCountsFailure() throws Exception
     {
         TestApiFactory.ApiContext ctx = TestApiFactory.apiContext();
-        OpenApiParserTab tab = new OpenApiParserTab(ctx.api);
-        OpenApiParserModel model = (OpenApiParserModel) field(tab, "model");
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(ctx.api);
+        OpenApiSamplerModel model = (OpenApiSamplerModel) field(tab, "model");
         model.load(spec("https://scan.example", "/users"), "https://scan.example/openapi.json");
 
         Audit audit = mock(Audit.class);
@@ -662,8 +663,8 @@ final class OpenApiParserTabTest
         invoke(
                 tab,
                 "onSelectionAction",
-                new Class<?>[]{OpenApiParserTable.SelectionAction.class, List.class},
-                OpenApiParserTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
+                new Class<?>[]{OpenApiSamplerTable.SelectionAction.class, List.class},
+                OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
                 List.of(model.operations().get(0))
         );
 
@@ -677,8 +678,8 @@ final class OpenApiParserTabTest
     void activeAndPassiveScanTasksAreIndependent() throws Exception
     {
         TestApiFactory.ApiContext ctx = TestApiFactory.apiContext();
-        OpenApiParserTab tab = new OpenApiParserTab(ctx.api);
-        OpenApiParserModel model = (OpenApiParserModel) field(tab, "model");
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(ctx.api);
+        OpenApiSamplerModel model = (OpenApiSamplerModel) field(tab, "model");
         model.load(spec("https://scan.example", "/users"), "https://scan.example/openapi.json");
 
         Audit activeAudit = mock(Audit.class);
@@ -703,22 +704,22 @@ final class OpenApiParserTabTest
         invoke(
                 tab,
                 "onSelectionAction",
-                new Class<?>[]{OpenApiParserTable.SelectionAction.class, List.class},
-                OpenApiParserTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
+                new Class<?>[]{OpenApiSamplerTable.SelectionAction.class, List.class},
+                OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
                 List.of(model.operations().get(0))
         );
         invoke(
                 tab,
                 "onSelectionAction",
-                new Class<?>[]{OpenApiParserTable.SelectionAction.class, List.class},
-                OpenApiParserTable.SelectionAction.SEND_SELECTED_TO_PASSIVE_SCAN,
+                new Class<?>[]{OpenApiSamplerTable.SelectionAction.class, List.class},
+                OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_PASSIVE_SCAN,
                 List.of(model.operations().get(0))
         );
         invoke(
                 tab,
                 "onSelectionAction",
-                new Class<?>[]{OpenApiParserTable.SelectionAction.class, List.class},
-                OpenApiParserTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
+                new Class<?>[]{OpenApiSamplerTable.SelectionAction.class, List.class},
+                OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
                 List.of(model.operations().get(0))
         );
 
@@ -730,12 +731,61 @@ final class OpenApiParserTabTest
     }
 
     @Test
+    void disposeShutsDownExecutorAndIsIdempotent() throws Exception
+    {
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
+        ExecutorService workerPool = (ExecutorService) field(tab, "workerPool");
+
+        tab.dispose();
+        tab.dispose();
+
+        assertTrue(workerPool.isShutdown());
+    }
+
+    @Test
+    void urlListConcurrencyLimitIsOne() throws Exception
+    {
+        Field limitField = OpenApiSamplerTab.class.getDeclaredField("MAX_CONCURRENT_URL_FETCHES");
+        limitField.setAccessible(true);
+        int value = limitField.getInt(null);
+        assertEquals(1, value);
+    }
+
+    @Test
+    void bundledOfflineSamplesCanBeParsedFromLocalFiles() throws Exception
+    {
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
+
+        Path sample31 = Path.of("samples/openapi-3.1-discriminator.yaml");
+        Path sample20 = Path.of("samples/openapi-2.0-basic.yaml");
+        assertTrue(Files.exists(sample31));
+        assertTrue(Files.exists(sample20));
+
+        String sample31Content = Files.readString(sample31);
+        String sample20Content = Files.readString(sample20);
+
+        Object outcome31 = invoke(
+                tab,
+                "parseSpec",
+                new Class<?>[]{String.class, String.class, String.class, boolean.class},
+                sample31Content,
+                sample31.getFileName().toString(),
+                sample31.toUri().toString(),
+                true
+        );
+        OpenAPI openApi31 = (OpenAPI) recordValue(outcome31, "openAPI");
+        assertEquals("OpenAPI Sampler Demo 3.1", openApi31.getInfo().getTitle());
+        assertTrue(sample20Content.contains("swagger: '2.0'"));
+        assertTrue(Utils.looksLikeOpenApiSpec(sample20Content));
+    }
+
+    @Test
     void topBulkButtonsAreRemovedFromTabFields()
     {
-        assertThrows(NoSuchFieldException.class, () -> OpenApiParserTab.class.getDeclaredField("generateAllButton"));
-        assertThrows(NoSuchFieldException.class, () -> OpenApiParserTab.class.getDeclaredField("deleteSelectedButton"));
-        assertThrows(NoSuchFieldException.class, () -> OpenApiParserTab.class.getDeclaredField("repeaterSelectedButton"));
-        assertThrows(NoSuchFieldException.class, () -> OpenApiParserTab.class.getDeclaredField("intruderSelectedButton"));
+        assertThrows(NoSuchFieldException.class, () -> OpenApiSamplerTab.class.getDeclaredField("generateAllButton"));
+        assertThrows(NoSuchFieldException.class, () -> OpenApiSamplerTab.class.getDeclaredField("deleteSelectedButton"));
+        assertThrows(NoSuchFieldException.class, () -> OpenApiSamplerTab.class.getDeclaredField("repeaterSelectedButton"));
+        assertThrows(NoSuchFieldException.class, () -> OpenApiSamplerTab.class.getDeclaredField("intruderSelectedButton"));
     }
 
     private OpenAPI spec(String server, String path)
@@ -778,7 +828,7 @@ final class OpenApiParserTabTest
         return accessorMethod.invoke(record);
     }
 
-    private boolean waitForStatus(OpenApiParserTab tab, Predicate<String> predicate) throws Exception
+    private boolean waitForStatus(OpenApiSamplerTab tab, Predicate<String> predicate) throws Exception
     {
         long deadline = System.currentTimeMillis() + 2_000L;
         JLabelHolder labelHolder = new JLabelHolder((javax.swing.JLabel) field(tab, "statusLabel"));

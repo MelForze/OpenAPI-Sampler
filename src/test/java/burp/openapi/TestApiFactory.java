@@ -3,6 +3,7 @@ package burp.openapi;
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.core.Registration;
 import burp.api.montoya.extension.Extension;
+import burp.api.montoya.extension.ExtensionUnloadingHandler;
 import burp.api.montoya.http.Http;
 import burp.api.montoya.intruder.Intruder;
 import burp.api.montoya.logging.Logging;
@@ -48,7 +49,9 @@ final class TestApiFactory
         Persistence persistence = mock(Persistence.class);
         PersistedObject extensionData = mock(PersistedObject.class);
 
-        Registration registration = mock(Registration.class);
+        Registration suiteTabRegistration = mock(Registration.class);
+        Registration contextMenuRegistration = mock(Registration.class);
+        Registration unloadingRegistration = mock(Registration.class);
         Map<String, String> persistedStrings = new ConcurrentHashMap<>();
 
         when(api.extension()).thenReturn(extension);
@@ -64,9 +67,13 @@ final class TestApiFactory
         when(persistence.extensionData()).thenReturn(extensionData);
 
         when(userInterface.createHttpRequestEditor(any(EditorOptions[].class))).thenReturn(requestEditor);
-        when(userInterface.registerSuiteTab(anyString(), any())).thenReturn(registration);
-        when(userInterface.registerContextMenuItemsProvider(any())).thenReturn(registration);
+        when(userInterface.registerSuiteTab(anyString(), any())).thenReturn(suiteTabRegistration);
+        when(userInterface.registerContextMenuItemsProvider(any())).thenReturn(contextMenuRegistration);
+        when(extension.registerUnloadingHandler(any(ExtensionUnloadingHandler.class))).thenReturn(unloadingRegistration);
         when(requestEditor.uiComponent()).thenReturn(new JPanel());
+        when(suiteTabRegistration.isRegistered()).thenReturn(true);
+        when(contextMenuRegistration.isRegistered()).thenReturn(true);
+        when(unloadingRegistration.isRegistered()).thenReturn(true);
 
         when(extensionData.getString(anyString())).thenAnswer(invocation -> persistedStrings.get(invocation.getArgument(0)));
         doAnswer(invocation -> {
@@ -92,7 +99,10 @@ final class TestApiFactory
                 siteMap,
                 scanner,
                 persistence,
-                extensionData
+                extensionData,
+                suiteTabRegistration,
+                contextMenuRegistration,
+                unloadingRegistration
         );
     }
 
@@ -111,6 +121,9 @@ final class TestApiFactory
         final Scanner scanner;
         final Persistence persistence;
         final PersistedObject extensionData;
+        final Registration suiteTabRegistration;
+        final Registration contextMenuRegistration;
+        final Registration unloadingRegistration;
 
         private ApiContext(
                 MontoyaApi api,
@@ -125,7 +138,10 @@ final class TestApiFactory
                 SiteMap siteMap,
                 Scanner scanner,
                 Persistence persistence,
-                PersistedObject extensionData)
+                PersistedObject extensionData,
+                Registration suiteTabRegistration,
+                Registration contextMenuRegistration,
+                Registration unloadingRegistration)
         {
             this.api = api;
             this.extension = extension;
@@ -140,6 +156,9 @@ final class TestApiFactory
             this.scanner = scanner;
             this.persistence = persistence;
             this.extensionData = extensionData;
+            this.suiteTabRegistration = suiteTabRegistration;
+            this.contextMenuRegistration = contextMenuRegistration;
+            this.unloadingRegistration = unloadingRegistration;
         }
     }
 }

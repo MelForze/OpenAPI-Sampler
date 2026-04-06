@@ -26,7 +26,7 @@ import java.util.Set;
 /**
  * Domain model for currently loaded OpenAPI definition and flattened operations table.
  */
-public final class OpenApiParserModel
+public final class OpenApiSamplerModel
 {
     private OpenAPI openAPI;
     private String sourceLocation;

@@ -17,13 +17,13 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-final class OpenApiParserTableTest
+final class OpenApiSamplerTableTest
 {
     @Test
     void setOperationsAndVisibleOperationsWork() throws Exception
     {
-        OpenApiParserTable table = new OpenApiParserTable();
-        List<OpenApiParserModel.OperationContext> operations = List.of(op("GET", "/users"), op("POST", "/users"));
+        OpenApiSamplerTable table = new OpenApiSamplerTable();
+        List<OpenApiSamplerModel.OperationContext> operations = List.of(op("GET", "/users"), op("POST", "/users"));
 
         onEdt(() -> table.setOperations(operations));
 
@@ -34,7 +34,7 @@ final class OpenApiParserTableTest
     @Test
     void methodAndServerAreFirstColumns() throws Exception
     {
-        OpenApiParserTable parserTable = new OpenApiParserTable();
+        OpenApiSamplerTable parserTable = new OpenApiSamplerTable();
         JTable jTable = tableOf(parserTable);
 
         assertEquals("Method", jTable.getColumnName(0));
@@ -45,11 +45,11 @@ final class OpenApiParserTableTest
     @Test
     void canHideAndShowColumn() throws Exception
     {
-        OpenApiParserTable parserTable = new OpenApiParserTable();
+        OpenApiSamplerTable parserTable = new OpenApiSamplerTable();
         JTable jTable = tableOf(parserTable);
         int initialColumns = jTable.getColumnModel().getColumnCount();
 
-        Method setColumnVisible = OpenApiParserTable.class.getDeclaredMethod("setColumnVisible", int.class, boolean.class);
+        Method setColumnVisible = OpenApiSamplerTable.class.getDeclaredMethod("setColumnVisible", int.class, boolean.class);
         setColumnVisible.setAccessible(true);
 
         onEdt(() -> invokeSetColumnVisible(setColumnVisible, parserTable, 3, false));
@@ -64,9 +64,9 @@ final class OpenApiParserTableTest
     @Test
     void cannotHideLastVisibleColumn() throws Exception
     {
-        OpenApiParserTable parserTable = new OpenApiParserTable();
+        OpenApiSamplerTable parserTable = new OpenApiSamplerTable();
         JTable jTable = tableOf(parserTable);
-        Method setColumnVisible = OpenApiParserTable.class.getDeclaredMethod("setColumnVisible", int.class, boolean.class);
+        Method setColumnVisible = OpenApiSamplerTable.class.getDeclaredMethod("setColumnVisible", int.class, boolean.class);
         setColumnVisible.setAccessible(true);
 
         int totalColumns = jTable.getModel().getColumnCount();
@@ -89,12 +89,12 @@ final class OpenApiParserTableTest
     @Test
     void selectAllAndClearSelectionWork() throws Exception
     {
-        OpenApiParserTable parserTable = new OpenApiParserTable();
-        List<OpenApiParserModel.OperationContext> operations = List.of(op("GET", "/a"), op("POST", "/b"), op("DELETE", "/c"));
+        OpenApiSamplerTable parserTable = new OpenApiSamplerTable();
+        List<OpenApiSamplerModel.OperationContext> operations = List.of(op("GET", "/a"), op("POST", "/b"), op("DELETE", "/c"));
 
         onEdt(() -> parserTable.setOperations(operations));
         onEdt(parserTable::selectAllRows);
-        List<OpenApiParserModel.OperationContext> selected = parserTable.selectedOperations();
+        List<OpenApiSamplerModel.OperationContext> selected = parserTable.selectedOperations();
         assertEquals(3, selected.size());
 
         onEdt(parserTable::clearSelection);
@@ -104,16 +104,16 @@ final class OpenApiParserTableTest
     @Test
     void firstSelectedOperationAndSelectionChangedCallbackWork() throws Exception
     {
-        OpenApiParserTable parserTable = new OpenApiParserTable();
+        OpenApiSamplerTable parserTable = new OpenApiSamplerTable();
         onEdt(() -> parserTable.setOperations(List.of(op("GET", "/users"), op("POST", "/orders"))));
 
-        AtomicReference<OpenApiParserModel.OperationContext> callbackSelection = new AtomicReference<>();
+        AtomicReference<OpenApiSamplerModel.OperationContext> callbackSelection = new AtomicReference<>();
         onEdt(() -> parserTable.setSelectionChangedListener(callbackSelection::set));
 
         JTable jTable = tableOf(parserTable);
         onEdt(() -> jTable.setRowSelectionInterval(1, 1));
 
-        OpenApiParserModel.OperationContext firstSelected = parserTable.firstSelectedOperation();
+        OpenApiSamplerModel.OperationContext firstSelected = parserTable.firstSelectedOperation();
         assertNotNull(firstSelected);
         assertEquals("/orders", firstSelected.path());
         assertNotNull(callbackSelection.get());
@@ -123,12 +123,12 @@ final class OpenApiParserTableTest
     @Test
     void rowButtonActionInvokesListenerWithOperation() throws Exception
     {
-        OpenApiParserTable parserTable = new OpenApiParserTable();
-        OpenApiParserModel.OperationContext operation = op("GET", "/users");
+        OpenApiSamplerTable parserTable = new OpenApiSamplerTable();
+        OpenApiSamplerModel.OperationContext operation = op("GET", "/users");
         onEdt(() -> parserTable.setOperations(List.of(operation)));
 
-        AtomicReference<OpenApiParserTable.RowAction> actionRef = new AtomicReference<>();
-        AtomicReference<OpenApiParserModel.OperationContext> operationRef = new AtomicReference<>();
+        AtomicReference<OpenApiSamplerTable.RowAction> actionRef = new AtomicReference<>();
+        AtomicReference<OpenApiSamplerModel.OperationContext> operationRef = new AtomicReference<>();
         onEdt(() -> parserTable.setRowActionListener((action, selectedOperation) -> {
             actionRef.set(action);
             operationRef.set(selectedOperation);
@@ -143,37 +143,37 @@ final class OpenApiParserTableTest
             ((JButton) jTable.getEditorComponent()).doClick();
         });
 
-        assertEquals(OpenApiParserTable.RowAction.COPY_AS_CURL, actionRef.get());
+        assertEquals(OpenApiSamplerTable.RowAction.COPY_AS_CURL, actionRef.get());
         assertEquals("/users", operationRef.get().path());
     }
 
     @Test
     void selectionActionUsesPopupSnapshotWhenPresent() throws Exception
     {
-        OpenApiParserTable parserTable = new OpenApiParserTable();
-        List<OpenApiParserModel.OperationContext> operations = List.of(op("GET", "/a"), op("POST", "/b"));
+        OpenApiSamplerTable parserTable = new OpenApiSamplerTable();
+        List<OpenApiSamplerModel.OperationContext> operations = List.of(op("GET", "/a"), op("POST", "/b"));
         onEdt(() -> parserTable.setOperations(operations));
 
-        List<OpenApiParserModel.OperationContext> received = new ArrayList<>();
-        AtomicReference<OpenApiParserTable.SelectionAction> actionRef = new AtomicReference<>();
+        List<OpenApiSamplerModel.OperationContext> received = new ArrayList<>();
+        AtomicReference<OpenApiSamplerTable.SelectionAction> actionRef = new AtomicReference<>();
         onEdt(() -> parserTable.setSelectionActionListener((action, selected) -> {
             actionRef.set(action);
             received.clear();
             received.addAll(selected);
         }));
 
-        Field popupSelectionSnapshot = OpenApiParserTable.class.getDeclaredField("popupSelectionSnapshot");
+        Field popupSelectionSnapshot = OpenApiSamplerTable.class.getDeclaredField("popupSelectionSnapshot");
         popupSelectionSnapshot.setAccessible(true);
         popupSelectionSnapshot.set(parserTable, List.of(operations.get(1)));
 
-        Method fireSelectionAction = OpenApiParserTable.class
-                .getDeclaredMethod("fireSelectionAction", OpenApiParserTable.SelectionAction.class);
+        Method fireSelectionAction = OpenApiSamplerTable.class
+                .getDeclaredMethod("fireSelectionAction", OpenApiSamplerTable.SelectionAction.class);
         fireSelectionAction.setAccessible(true);
 
         onEdt(() -> {
             try
             {
-                fireSelectionAction.invoke(parserTable, OpenApiParserTable.SelectionAction.SEND_SELECTED_TO_REPEATER);
+                fireSelectionAction.invoke(parserTable, OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_REPEATER);
             }
             catch (Exception ex)
             {
@@ -181,7 +181,7 @@ final class OpenApiParserTableTest
             }
         });
 
-        assertEquals(OpenApiParserTable.SelectionAction.SEND_SELECTED_TO_REPEATER, actionRef.get());
+        assertEquals(OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_REPEATER, actionRef.get());
         assertEquals(1, received.size());
         assertEquals("/b", received.get(0).path());
     }
@@ -189,36 +189,36 @@ final class OpenApiParserTableTest
     @Test
     void selectAllClearSelectionAndVisibleActionsProvideEmptyPayload() throws Exception
     {
-        OpenApiParserTable parserTable = new OpenApiParserTable();
+        OpenApiSamplerTable parserTable = new OpenApiSamplerTable();
         onEdt(() -> parserTable.setOperations(List.of(op("GET", "/a"))));
 
         AtomicReference<Integer> payloadSize = new AtomicReference<>(-1);
         onEdt(() -> parserTable.setSelectionActionListener((action, selected) -> payloadSize.set(selected.size())));
 
-        Method fireSelectionAction = OpenApiParserTable.class
-                .getDeclaredMethod("fireSelectionAction", OpenApiParserTable.SelectionAction.class);
+        Method fireSelectionAction = OpenApiSamplerTable.class
+                .getDeclaredMethod("fireSelectionAction", OpenApiSamplerTable.SelectionAction.class);
         fireSelectionAction.setAccessible(true);
 
-        onEdt(() -> invokeUnchecked(fireSelectionAction, parserTable, OpenApiParserTable.SelectionAction.SELECT_ALL));
+        onEdt(() -> invokeUnchecked(fireSelectionAction, parserTable, OpenApiSamplerTable.SelectionAction.SELECT_ALL));
         assertEquals(0, payloadSize.get());
 
-        onEdt(() -> invokeUnchecked(fireSelectionAction, parserTable, OpenApiParserTable.SelectionAction.CLEAR_SELECTION));
+        onEdt(() -> invokeUnchecked(fireSelectionAction, parserTable, OpenApiSamplerTable.SelectionAction.CLEAR_SELECTION));
         assertEquals(0, payloadSize.get());
 
-        onEdt(() -> invokeUnchecked(fireSelectionAction, parserTable, OpenApiParserTable.SelectionAction.SEND_VISIBLE_TO_REPEATER));
+        onEdt(() -> invokeUnchecked(fireSelectionAction, parserTable, OpenApiSamplerTable.SelectionAction.SEND_VISIBLE_TO_REPEATER));
         assertEquals(0, payloadSize.get());
     }
 
-    private JTable tableOf(OpenApiParserTable table) throws Exception
+    private JTable tableOf(OpenApiSamplerTable table) throws Exception
     {
-        Field field = OpenApiParserTable.class.getDeclaredField("table");
+        Field field = OpenApiSamplerTable.class.getDeclaredField("table");
         field.setAccessible(true);
         return (JTable) field.get(table);
     }
 
-    private OpenApiParserModel.OperationContext op(String method, String path)
+    private OpenApiSamplerModel.OperationContext op(String method, String path)
     {
-        return new OpenApiParserModel.OperationContext(
+        return new OpenApiSamplerModel.OperationContext(
                 "source:test",
                 "test-source",
                 "https://api.example/openapi.json",

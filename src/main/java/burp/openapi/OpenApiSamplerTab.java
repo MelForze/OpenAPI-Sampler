@@ -69,6 +69,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -76,15 +77,16 @@ import java.util.regex.Pattern;
 /**
  * Main UI tab and behavior controller.
  */
-public final class OpenApiParserTab implements ContextMenuItemsProvider
+public final class OpenApiSamplerTab implements ContextMenuItemsProvider
 {
-    private static final String TAB_TITLE = "OpenAPI Parser";
-    private static final String EXTENSION_PREFIX = "[OpenAPI Parser] ";
+    private static final String TAB_TITLE = "OpenAPI Sampler";
+    private static final String EXTENSION_PREFIX = "[OpenAPI Sampler] ";
     private static final String DEFAULT_SERVER_ITEM = "(Operation default)";
     private static final String DEFAULT_SOURCE_ITEM = "(All sources)";
     private static final int MAX_SPEC_FETCH_ATTEMPTS = 24;
     private static final int MAX_FETCH_RETRIES = 3;
     private static final int FETCH_RETRY_BACKOFF_MS = 250;
+    private static final int MAX_CONCURRENT_URL_FETCHES = 1;
     private static final long RESPONSE_TIMEOUT_MS = 25_000L;
     private static final long PER_ATTEMPT_DEADLINE_MS = 30_000L;
     private static final int MAX_SPEC_SIZE_BYTES = 5 * 1024 * 1024;
@@ -99,8 +101,8 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
 
     private final MontoyaApi api;
     private final JPanel rootPanel;
-    private final OpenApiParserModel model;
-    private final OpenApiParserTable table;
+    private final OpenApiSamplerModel model;
+    private final OpenApiSamplerTable table;
     private final RequestGenerator requestGenerator;
     private final ExecutorService workerPool;
     private final SpecFetcher specFetcher;
@@ -123,6 +125,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
     private final Set<String> autoIncludedHosts = ConcurrentHashMap.newKeySet();
     private final List<String> lastLoadFailures = new CopyOnWriteArrayList<>();
     private final Object auditLock = new Object();
+    private final AtomicBoolean disposed = new AtomicBoolean(false);
 
     private volatile boolean loadingInProgress;
     private volatile boolean cancelRequested;
@@ -131,20 +134,20 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
     private String restoredSourceId = "";
     private String restoredServer = "";
 
-    public OpenApiParserTab(MontoyaApi api)
+    public OpenApiSamplerTab(MontoyaApi api)
     {
         this(api, null);
     }
 
-    OpenApiParserTab(MontoyaApi api, SpecFetcher specFetcher)
+    OpenApiSamplerTab(MontoyaApi api, SpecFetcher specFetcher)
     {
         this.api = Objects.requireNonNull(api, "api must not be null");
-        this.model = new OpenApiParserModel();
-        this.table = new OpenApiParserTable();
+        this.model = new OpenApiSamplerModel();
+        this.table = new OpenApiSamplerTable();
         this.requestGenerator = new RequestGenerator();
         this.specFetcher = specFetcher != null ? specFetcher : this::fetchViaMontoya;
         this.workerPool = Executors.newFixedThreadPool(2, runnable -> {
-            Thread worker = new Thread(runnable, "openapi-parser-worker");
+            Thread worker = new Thread(runnable, "openapi-sampler-worker");
             worker.setDaemon(true);
             return worker;
         });
@@ -289,6 +292,65 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         return rootPanel;
     }
 
+    public void dispose()
+    {
+        if (!disposed.compareAndSet(false, true))
+        {
+            return;
+        }
+
+        cancelRequested = true;
+        loadingInProgress = false;
+        activeAuditTask = null;
+        passiveAuditTask = null;
+        autoIncludedHosts.clear();
+        lastLoadFailures.clear();
+
+        workerPool.shutdown();
+        try
+        {
+            if (!workerPool.awaitTermination(3, TimeUnit.SECONDS))
+            {
+                workerPool.shutdownNow();
+                workerPool.awaitTermination(2, TimeUnit.SECONDS);
+            }
+        }
+        catch (InterruptedException interrupted)
+        {
+            workerPool.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+
+        try
+        {
+            if (SwingUtilities.isEventDispatchThread())
+            {
+                clearUiForDispose();
+            }
+            else
+            {
+                SwingUtilities.invokeAndWait(this::clearUiForDispose);
+            }
+        }
+        catch (Exception ignored)
+        {
+            // Best-effort cleanup; unload should proceed even if UI teardown fails.
+        }
+    }
+
+    private void clearUiForDispose()
+    {
+        table.dispose();
+        model.clear();
+        sourceSelector.removeAllItems();
+        serverSelector.removeAllItems();
+        filterField.setText("");
+        urlField.setText("");
+        requestPreviewEditor.setRequest(previewPlaceholderRequest());
+        statusLabel.setText("Extension unloaded.");
+        progressLabel.setText("Progress: unloaded");
+    }
+
     @Override
     public List<Component> provideMenuItems(ContextMenuEvent event)
     {
@@ -320,7 +382,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
             return Collections.emptyList();
         }
 
-        JMenuItem menuItem = new JMenuItem("Send to OpenAPI Parser");
+        JMenuItem menuItem = new JMenuItem("Send to OpenAPI Sampler");
         menuItem.addActionListener(e -> {
             if (hasOpenApiBody)
             {
@@ -389,6 +451,11 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
 
     private void runBackgroundUrlListLoad(Path listPath)
     {
+        if (disposed.get())
+        {
+            return;
+        }
+
         if (loadingInProgress)
         {
             statusLabel.setText("OpenAPI loading is already in progress...");
@@ -399,7 +466,8 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         cancelRequested = false;
         loadingInProgress = true;
         progressLabel.setText("Progress: preparing URL list...");
-        setLoadingState(true, "Fetching OpenAPI specs from URL list...");
+        setLoadingState(true, "Fetching OpenAPI specs from URL list (max concurrent fetches: "
+                + MAX_CONCURRENT_URL_FETCHES + ")...");
 
         CompletableFuture
                 .supplyAsync(() -> {
@@ -413,6 +481,10 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
                     }
                 }, workerPool)
                 .whenComplete((result, throwable) -> SwingUtilities.invokeLater(() -> {
+                    if (disposed.get())
+                    {
+                        return;
+                    }
                     loadingInProgress = false;
                     cancelRequested = false;
                     setLoadingState(false, null);
@@ -468,7 +540,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         boolean canceled = false;
         for (String url : parsed.urls())
         {
-            if (cancelRequested)
+            if (cancelRequested || disposed.get())
             {
                 canceled = true;
                 break;
@@ -870,7 +942,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
                 .withAddedHeader("Accept", "application/json, application/yaml, text/yaml, */*");
 
         FutureTask<HttpRequestResponse> requestTask = new FutureTask<>(() -> api.http().sendRequest(specRequest, requestOptions));
-        Thread requestThread = new Thread(requestTask, "openapi-parser-fetch");
+        Thread requestThread = new Thread(requestTask, "openapi-sampler-fetch");
         requestThread.setDaemon(true);
         requestThread.start();
 
@@ -1628,6 +1700,11 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
 
     private void runBackgroundLoad(String statusMessage, CheckedSupplier<ParseOutcome> task, String actionLabel)
     {
+        if (disposed.get())
+        {
+            return;
+        }
+
         if (loadingInProgress)
         {
             statusLabel.setText("OpenAPI loading is already in progress...");
@@ -1651,6 +1728,10 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
                     }
                 }, workerPool)
                 .whenComplete((outcome, throwable) -> SwingUtilities.invokeLater(() -> {
+                    if (disposed.get())
+                    {
+                        return;
+                    }
                     loadingInProgress = false;
                     cancelRequested = false;
                     setLoadingState(false, null);
@@ -1975,7 +2056,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
 
     private void applyFilter()
     {
-        List<OpenApiParserModel.OperationContext> filtered = model.filter(filterField.getText(), selectedServer(), selectedSourceId());
+        List<OpenApiSamplerModel.OperationContext> filtered = model.filter(filterField.getText(), selectedServer(), selectedSourceId());
         table.setOperations(filtered);
 
         statusLabel.setText("Showing " + filtered.size() + " / " + model.operations().size() + " operation(s)");
@@ -1990,7 +2071,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         sourceSelector.removeAllItems();
         sourceSelector.addItem(SourceSelection.allSources());
 
-        for (OpenApiParserModel.SourceContext source : model.availableSources())
+        for (OpenApiSamplerModel.SourceContext source : model.availableSources())
         {
             if (source == null || Utils.isBlank(source.id()))
             {
@@ -2025,7 +2106,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         return "";
     }
 
-    private void onTableSelectionChanged(OpenApiParserModel.OperationContext operationContext)
+    private void onTableSelectionChanged(OpenApiSamplerModel.OperationContext operationContext)
     {
         if (operationContext == null)
         {
@@ -2038,7 +2119,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
 
     private void refreshRequestPreviewFromSelection()
     {
-        OpenApiParserModel.OperationContext selectedOperation = table.firstSelectedOperation();
+        OpenApiSamplerModel.OperationContext selectedOperation = table.firstSelectedOperation();
         if (selectedOperation == null)
         {
             setPreviewPlaceholder("Request preview: select an operation.");
@@ -2047,7 +2128,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         updateRequestPreview(selectedOperation);
     }
 
-    private void updateRequestPreview(OpenApiParserModel.OperationContext operationContext)
+    private void updateRequestPreview(OpenApiSamplerModel.OperationContext operationContext)
     {
         try
         {
@@ -2073,7 +2154,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         return HttpRequest.httpRequest("GET / HTTP/1.1\r\nHost: preview.local\r\n\r\n");
     }
 
-    private void onRowAction(OpenApiParserTable.RowAction action, OpenApiParserModel.OperationContext operationContext)
+    private void onRowAction(OpenApiSamplerTable.RowAction action, OpenApiSamplerModel.OperationContext operationContext)
     {
         try
         {
@@ -2112,7 +2193,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
 
     private void sendVisibleToRepeater()
     {
-        List<OpenApiParserModel.OperationContext> operations = table.visibleOperations();
+        List<OpenApiSamplerModel.OperationContext> operations = table.visibleOperations();
         if (operations.isEmpty())
         {
             showError("No operations", "There are no operations to generate.");
@@ -2122,7 +2203,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         int sent = 0;
         int failed = 0;
 
-        for (OpenApiParserModel.OperationContext operation : operations)
+        for (OpenApiSamplerModel.OperationContext operation : operations)
         {
             try
             {
@@ -2142,7 +2223,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         log("Visible -> Repeater completed. Sent=" + sent + ", Failed=" + failed);
     }
 
-    private void onSelectionAction(OpenApiParserTable.SelectionAction action, List<OpenApiParserModel.OperationContext> selected)
+    private void onSelectionAction(OpenApiSamplerTable.SelectionAction action, List<OpenApiSamplerModel.OperationContext> selected)
     {
         if (action == null)
         {
@@ -2215,7 +2296,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         }
     }
 
-    private boolean ensureSelectionForPopup(List<OpenApiParserModel.OperationContext> selected, String action)
+    private boolean ensureSelectionForPopup(List<OpenApiSamplerModel.OperationContext> selected, String action)
     {
         if (selected == null || selected.isEmpty())
         {
@@ -2225,7 +2306,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         return true;
     }
 
-    private void deleteSelectedOperations(List<OpenApiParserModel.OperationContext> selected, boolean confirm)
+    private void deleteSelectedOperations(List<OpenApiSamplerModel.OperationContext> selected, boolean confirm)
     {
         if (confirm)
         {
@@ -2251,11 +2332,11 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         log("Removed selected operations: " + removed);
     }
 
-    private void sendSelectedToRepeater(List<OpenApiParserModel.OperationContext> selected)
+    private void sendSelectedToRepeater(List<OpenApiSamplerModel.OperationContext> selected)
     {
         int sent = 0;
         int failed = 0;
-        for (OpenApiParserModel.OperationContext operation : selected)
+        for (OpenApiSamplerModel.OperationContext operation : selected)
         {
             try
             {
@@ -2275,7 +2356,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         log("Selected requests sent to Repeater. Sent=" + sent + ", Failed=" + failed);
     }
 
-    private String repeaterTabName(String bucket, OpenApiParserModel.OperationContext operation, HttpRequest request)
+    private String repeaterTabName(String bucket, OpenApiSamplerModel.OperationContext operation, HttpRequest request)
     {
         String host = "unknown-host";
         String endpoint = Utils.coalesce(operation != null ? operation.path() : null, "/");
@@ -2314,14 +2395,14 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
             // Keep operation-path fallback.
         }
 
-        return "OpenAPI Parser / " + bucket + " / " + host + " / " + method + " " + endpoint;
+        return "OpenAPI Sampler / " + bucket + " / " + host + " / " + method + " " + endpoint;
     }
 
-    private void sendSelectedToIntruder(List<OpenApiParserModel.OperationContext> selected)
+    private void sendSelectedToIntruder(List<OpenApiSamplerModel.OperationContext> selected)
     {
         int sent = 0;
         int failed = 0;
-        for (OpenApiParserModel.OperationContext operation : selected)
+        for (OpenApiSamplerModel.OperationContext operation : selected)
         {
             try
             {
@@ -2340,8 +2421,12 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         log("Selected requests sent to Intruder. Sent=" + sent + ", Failed=" + failed);
     }
 
-    private void sendSelectedToAudit(List<OpenApiParserModel.OperationContext> selected, boolean active)
+    private void sendSelectedToAudit(List<OpenApiSamplerModel.OperationContext> selected, boolean active)
     {
+        if (disposed.get())
+        {
+            return;
+        }
         if (selected == null || selected.isEmpty())
         {
             return;
@@ -2352,7 +2437,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         workerPool.submit(() -> queueSelectedForAudit(selected, active));
     }
 
-    private void queueSelectedForAudit(List<OpenApiParserModel.OperationContext> selected, boolean active)
+    private void queueSelectedForAudit(List<OpenApiSamplerModel.OperationContext> selected, boolean active)
     {
         String mode = active ? "Active" : "Passive";
         Audit audit;
@@ -2378,7 +2463,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         int autoIncluded = 0;
         int recreated = 0;
         int retried = 0;
-        for (OpenApiParserModel.OperationContext operation : selected)
+        for (OpenApiSamplerModel.OperationContext operation : selected)
         {
             HttpRequest request;
             try
@@ -2607,13 +2692,13 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         }
     }
 
-    private void copySelectedAsCurl(List<OpenApiParserModel.OperationContext> selected)
+    private void copySelectedAsCurl(List<OpenApiSamplerModel.OperationContext> selected)
     {
         StringBuilder all = new StringBuilder();
         int copied = 0;
         int failed = 0;
 
-        for (OpenApiParserModel.OperationContext operation : selected)
+        for (OpenApiSamplerModel.OperationContext operation : selected)
         {
             try
             {
@@ -2641,13 +2726,13 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         }
     }
 
-    private void copySelectedAsPython(List<OpenApiParserModel.OperationContext> selected)
+    private void copySelectedAsPython(List<OpenApiSamplerModel.OperationContext> selected)
     {
         StringBuilder all = new StringBuilder();
         int copied = 0;
         int failed = 0;
 
-        for (OpenApiParserModel.OperationContext operation : selected)
+        for (OpenApiSamplerModel.OperationContext operation : selected)
         {
             try
             {
@@ -2675,11 +2760,11 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         }
     }
 
-    private void exportSelectedRequests(List<OpenApiParserModel.OperationContext> selected)
+    private void exportSelectedRequests(List<OpenApiSamplerModel.OperationContext> selected)
     {
         JFileChooser chooser = new JFileChooser();
         chooser.setDialogTitle("Export selected requests");
-        chooser.setSelectedFile(new File("openapi-parser-requests.txt"));
+        chooser.setSelectedFile(new File("openapi-sampler-requests.txt"));
 
         int result = chooser.showSaveDialog(rootPanel);
         if (result != JFileChooser.APPROVE_OPTION)
@@ -2719,7 +2804,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         log("Exported selected requests. Exported=" + exported + ", Failed=" + failed + ", File=" + outputPath);
     }
 
-    private ExportDocument buildExportDocument(List<OpenApiParserModel.OperationContext> selected)
+    private ExportDocument buildExportDocument(List<OpenApiSamplerModel.OperationContext> selected)
     {
         if (selected == null || selected.isEmpty())
         {
@@ -2729,7 +2814,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         StringBuilder all = new StringBuilder();
         int exported = 0;
         int failed = 0;
-        for (OpenApiParserModel.OperationContext operation : selected)
+        for (OpenApiSamplerModel.OperationContext operation : selected)
         {
             HttpRequest request;
             try
@@ -2787,7 +2872,7 @@ public final class OpenApiParserTab implements ContextMenuItemsProvider
         return selected == null ? DEFAULT_SERVER_ITEM : String.valueOf(selected);
     }
 
-    private List<String> fallbackServersForOperation(OpenApiParserModel.OperationContext operationContext)
+    private List<String> fallbackServersForOperation(OpenApiSamplerModel.OperationContext operationContext)
     {
         if (operationContext != null && Utils.nonBlank(operationContext.sourceId()))
         {

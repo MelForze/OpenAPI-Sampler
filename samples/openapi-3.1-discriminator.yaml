@@ -1,0 +1,59 @@
+openapi: 3.1.0
+info:
+  title: OpenAPI Sampler Demo 3.1
+  version: 1.0.0
+servers:
+  - url: https://api.demo.local
+paths:
+  /pets:
+    post:
+      summary: Create pet with discriminator-aware body
+      operationId: createPet
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Pet'
+      responses:
+        '201':
+          description: Created
+components:
+  schemas:
+    Pet:
+      oneOf:
+        - $ref: '#/components/schemas/Cat'
+        - $ref: '#/components/schemas/Dog'
+      discriminator:
+        propertyName: petType
+        mapping:
+          cat: '#/components/schemas/Cat'
+          dog: '#/components/schemas/Dog'
+    Cat:
+      type: object
+      required: [petType, name, huntingSkill]
+      properties:
+        petType:
+          type: string
+          example: cat
+        name:
+          type: string
+          example: milo
+        huntingSkill:
+          type: string
+          enum: [clueless, lazy, adventurous, aggressive]
+          default: adventurous
+    Dog:
+      type: object
+      required: [petType, name, packSize]
+      properties:
+        petType:
+          type: string
+          example: dog
+        name:
+          type: string
+          example: rex
+        packSize:
+          type: integer
+          minimum: 1
+          default: 3

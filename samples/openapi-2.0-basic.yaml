@@ -1,0 +1,27 @@
+swagger: '2.0'
+info:
+  title: OpenAPI Sampler Demo 2.0
+  version: '1.0'
+host: legacy.demo.local
+basePath: /api
+schemes:
+  - https
+paths:
+  /users/{id}:
+    get:
+      summary: Get user by id
+      operationId: getUserById
+      parameters:
+        - name: id
+          in: path
+          required: true
+          type: string
+          default: sample-user
+        - name: verbose
+          in: query
+          required: false
+          type: boolean
+          default: true
+      responses:
+        '200':
+          description: OK

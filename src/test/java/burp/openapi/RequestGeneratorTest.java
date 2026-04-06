@@ -47,7 +47,7 @@ final class RequestGeneratorTest
                 new Parameter().in("cookie").name("session").example("cookie-1")
         );
 
-        OpenApiParserModel.OperationContext context = context(
+        OpenApiSamplerModel.OperationContext context = context(
                 "POST",
                 "/users/{id}",
                 List.of("https://operation.example"),
@@ -70,7 +70,7 @@ final class RequestGeneratorTest
     void unresolvedPathParametersAreReplacedByDeterministicPlaceholders()
     {
         RequestGenerator generator = new RequestGenerator();
-        OpenApiParserModel.OperationContext context = context(
+        OpenApiSamplerModel.OperationContext context = context(
                 "GET",
                 "/users/{id}/{slug}",
                 List.of("https://api.example"),
@@ -88,7 +88,7 @@ final class RequestGeneratorTest
     {
         RequestGenerator generator = new RequestGenerator();
 
-        OpenApiParserModel.OperationContext operationServerContext = context(
+        OpenApiSamplerModel.OperationContext operationServerContext = context(
                 "GET",
                 "/status",
                 List.of("https://op.example"),
@@ -100,7 +100,7 @@ final class RequestGeneratorTest
         HttpRequest fromOperationServer = generator.generate(operationServerContext, DEFAULT_SERVER, List.of("https://global.example"));
         assertTrue(fromOperationServer.url().startsWith("https://op.example/status"));
 
-        OpenApiParserModel.OperationContext globalServerContext = context(
+        OpenApiSamplerModel.OperationContext globalServerContext = context(
                 "GET",
                 "/status",
                 List.of(),
@@ -128,7 +128,7 @@ final class RequestGeneratorTest
         RequestBody requestBody = new RequestBody();
         requestBody.setContent(new Content().addMediaType("application/json", new MediaType().schema(schema)));
 
-        OpenApiParserModel.OperationContext context = context(
+        OpenApiSamplerModel.OperationContext context = context(
                 "POST",
                 "/users",
                 List.of("https://api.example"),
@@ -162,7 +162,7 @@ final class RequestGeneratorTest
         RequestBody requestBody = new RequestBody();
         requestBody.setContent(new Content().addMediaType("application/json", new MediaType().schema(recursive)));
 
-        OpenApiParserModel.OperationContext context = context(
+        OpenApiSamplerModel.OperationContext context = context(
                 "POST",
                 "/tree",
                 List.of("https://api.example"),
@@ -187,7 +187,7 @@ final class RequestGeneratorTest
         RequestBody requestBody = new RequestBody();
         requestBody.setContent(content);
 
-        OpenApiParserModel.OperationContext context = context(
+        OpenApiSamplerModel.OperationContext context = context(
                 "POST",
                 "/priority",
                 List.of("https://api.example"),
@@ -213,7 +213,7 @@ final class RequestGeneratorTest
         RequestBody requestBody = new RequestBody();
         requestBody.setContent(new Content().addMediaType("application/x-www-form-urlencoded", new MediaType().schema(formSchema)));
 
-        OpenApiParserModel.OperationContext context = context(
+        OpenApiSamplerModel.OperationContext context = context(
                 "POST",
                 "/login",
                 List.of("https://api.example"),
@@ -243,7 +243,7 @@ final class RequestGeneratorTest
         RequestBody requestBody = new RequestBody();
         requestBody.setContent(new Content().addMediaType("multipart/form-data", new MediaType().schema(multipartSchema)));
 
-        OpenApiParserModel.OperationContext context = context(
+        OpenApiSamplerModel.OperationContext context = context(
                 "POST",
                 "/upload",
                 List.of("https://api.example"),
@@ -256,7 +256,7 @@ final class RequestGeneratorTest
         String raw = request.toString();
         String body = request.bodyToString();
 
-        assertTrue(raw.contains("Content-Type: multipart/form-data; boundary=----OpenApiParserBoundary"));
+        assertTrue(raw.contains("Content-Type: multipart/form-data; boundary=----OpenApiSamplerBoundary"));
         assertTrue(body.contains("Content-Disposition: form-data; name=\"title\""));
         assertTrue(body.contains("report"));
     }
@@ -274,7 +274,7 @@ final class RequestGeneratorTest
         RequestBody requestBody = new RequestBody();
         requestBody.setContent(new Content().addMediaType("application/json", new MediaType().example(Map.of("ignored", true))));
 
-        OpenApiParserModel.OperationContext context = context(
+        OpenApiSamplerModel.OperationContext context = context(
                 "POST",
                 "/legacy-login",
                 List.of("https://api.example"),
@@ -304,7 +304,7 @@ final class RequestGeneratorTest
         Operation operation = new Operation();
         operation.setParameters(List.of(bodyParameter));
 
-        OpenApiParserModel.OperationContext context = context(
+        OpenApiSamplerModel.OperationContext context = context(
                 "POST",
                 "/legacy-body",
                 List.of("https://api.example"),
@@ -334,7 +334,7 @@ final class RequestGeneratorTest
         enumSchema.setEnum(List.of("from-enum", "other"));
         fromEnum.setSchema(enumSchema);
 
-        OpenApiParserModel.OperationContext context = context(
+        OpenApiSamplerModel.OperationContext context = context(
                 "GET",
                 "/fallbacks",
                 List.of("https://api.example"),
@@ -370,7 +370,7 @@ final class RequestGeneratorTest
         RequestBody allOfBody = new RequestBody().content(new Content().addMediaType("application/json", new MediaType().schema(allOfSchema)));
         RequestBody oneOfBody = new RequestBody().content(new Content().addMediaType("text/plain", new MediaType().schema(oneOfSchema)));
 
-        OpenApiParserModel.OperationContext allOfContext = context(
+        OpenApiSamplerModel.OperationContext allOfContext = context(
                 "POST",
                 "/all-of",
                 List.of("https://api.example"),
@@ -378,7 +378,7 @@ final class RequestGeneratorTest
                 allOfBody,
                 new Operation()
         );
-        OpenApiParserModel.OperationContext oneOfContext = context(
+        OpenApiSamplerModel.OperationContext oneOfContext = context(
                 "POST",
                 "/one-of",
                 List.of("https://api.example"),
@@ -409,7 +409,7 @@ final class RequestGeneratorTest
         RequestBody requestBody = new RequestBody()
                 .content(new Content().addMediaType("application/json", new MediaType().schema(anyOf)));
 
-        OpenApiParserModel.OperationContext context = context(
+        OpenApiSamplerModel.OperationContext context = context(
                 "POST",
                 "/any-of",
                 List.of("https://api.example"),
@@ -437,7 +437,7 @@ final class RequestGeneratorTest
         RequestBody requestBody = new RequestBody()
                 .content(new Content().addMediaType("application/json", new MediaType().schema(oneOf)));
 
-        OpenApiParserModel.OperationContext context = context(
+        OpenApiSamplerModel.OperationContext context = context(
                 "POST",
                 "/disc",
                 List.of("https://api.example"),
@@ -464,7 +464,7 @@ final class RequestGeneratorTest
         RequestBody requestBody = new RequestBody()
                 .content(new Content().addMediaType("application/json", new MediaType().schema(payload)));
 
-        OpenApiParserModel.OperationContext context = context(
+        OpenApiSamplerModel.OperationContext context = context(
                 "POST",
                 "/array",
                 List.of("https://api.example"),
@@ -482,7 +482,7 @@ final class RequestGeneratorTest
         assertTrue(occurrences <= 4); // pretty JSON adds quotes, but array count is capped to 3 items
     }
 
-    private OpenApiParserModel.OperationContext context(
+    private OpenApiSamplerModel.OperationContext context(
             String method,
             String path,
             List<String> servers,
@@ -490,7 +490,7 @@ final class RequestGeneratorTest
             RequestBody requestBody,
             Operation operation)
     {
-        return new OpenApiParserModel.OperationContext(
+        return new OpenApiSamplerModel.OperationContext(
                 "source:test",
                 "test-source",
                 "https://api.example/openapi.json",

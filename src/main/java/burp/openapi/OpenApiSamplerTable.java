@@ -32,7 +32,7 @@ import java.util.Objects;
 /**
  * Table panel with OpenAPI operations and row-level actions.
  */
-public final class OpenApiParserTable extends JPanel
+public final class OpenApiSamplerTable extends JPanel
 {
     public enum RowAction
     {
@@ -58,19 +58,19 @@ public final class OpenApiParserTable extends JPanel
     @FunctionalInterface
     public interface RowActionListener
     {
-        void onAction(RowAction action, OpenApiParserModel.OperationContext operationContext);
+        void onAction(RowAction action, OpenApiSamplerModel.OperationContext operationContext);
     }
 
     @FunctionalInterface
     public interface SelectionActionListener
     {
-        void onAction(SelectionAction action, List<OpenApiParserModel.OperationContext> selectedOperations);
+        void onAction(SelectionAction action, List<OpenApiSamplerModel.OperationContext> selectedOperations);
     }
 
     @FunctionalInterface
     public interface SelectionChangedListener
     {
-        void onSelectionChanged(OpenApiParserModel.OperationContext selectedOperation);
+        void onSelectionChanged(OpenApiSamplerModel.OperationContext selectedOperation);
     }
 
     private static final int COL_METHOD = 0;
@@ -89,10 +89,10 @@ public final class OpenApiParserTable extends JPanel
     private RowActionListener listener;
     private SelectionActionListener selectionActionListener;
     private SelectionChangedListener selectionChangedListener;
-    private List<OpenApiParserModel.OperationContext> popupSelectionSnapshot = List.of();
-    private OpenApiParserModel.OperationContext popupAnchorOperation;
+    private List<OpenApiSamplerModel.OperationContext> popupSelectionSnapshot = List.of();
+    private OpenApiSamplerModel.OperationContext popupAnchorOperation;
 
-    public OpenApiParserTable()
+    public OpenApiSamplerTable()
     {
         super(new BorderLayout());
 
@@ -142,17 +142,28 @@ public final class OpenApiParserTable extends JPanel
         this.selectionChangedListener = selectionChangedListener;
     }
 
-    public void setOperations(List<OpenApiParserModel.OperationContext> operations)
+    public void setOperations(List<OpenApiSamplerModel.OperationContext> operations)
     {
         model.setData(operations);
     }
 
-    public List<OpenApiParserModel.OperationContext> visibleOperations()
+    public void dispose()
+    {
+        listener = null;
+        selectionActionListener = null;
+        selectionChangedListener = null;
+        popupSelectionSnapshot = List.of();
+        popupAnchorOperation = null;
+        table.clearSelection();
+        model.setData(List.of());
+    }
+
+    public List<OpenApiSamplerModel.OperationContext> visibleOperations()
     {
         return model.data();
     }
 
-    public List<OpenApiParserModel.OperationContext> selectedOperations()
+    public List<OpenApiSamplerModel.OperationContext> selectedOperations()
     {
         int[] selectedRows = table.getSelectedRows();
         if (selectedRows == null || selectedRows.length == 0)
@@ -160,11 +171,11 @@ public final class OpenApiParserTable extends JPanel
             return List.of();
         }
 
-        List<OpenApiParserModel.OperationContext> selected = new ArrayList<>();
+        List<OpenApiSamplerModel.OperationContext> selected = new ArrayList<>();
         for (int selectedRow : selectedRows)
         {
             int modelRow = table.convertRowIndexToModel(selectedRow);
-            OpenApiParserModel.OperationContext operation = model.getAt(modelRow);
+            OpenApiSamplerModel.OperationContext operation = model.getAt(modelRow);
             if (operation != null)
             {
                 selected.add(operation);
@@ -186,7 +197,7 @@ public final class OpenApiParserTable extends JPanel
         }
     }
 
-    public OpenApiParserModel.OperationContext firstSelectedOperation()
+    public OpenApiSamplerModel.OperationContext firstSelectedOperation()
     {
         int selectedRow = table.getSelectedRow();
         if (selectedRow < 0)
@@ -362,7 +373,7 @@ public final class OpenApiParserTable extends JPanel
                 }
 
                 int row = table.rowAtPoint(e.getPoint());
-                OpenApiParserModel.OperationContext anchor = null;
+                OpenApiSamplerModel.OperationContext anchor = null;
                 if (row >= 0 && !table.isRowSelected(row))
                 {
                     table.getSelectionModel().setSelectionInterval(row, row);
@@ -386,7 +397,7 @@ public final class OpenApiParserTable extends JPanel
 
     private JPopupMenu buildPopupMenu()
     {
-        List<OpenApiParserModel.OperationContext> selected = popupSelectionSnapshot;
+        List<OpenApiSamplerModel.OperationContext> selected = popupSelectionSnapshot;
         boolean hasSelection = !selected.isEmpty() || popupAnchorOperation != null;
 
         JPopupMenu menu = new JPopupMenu();
@@ -423,7 +434,7 @@ public final class OpenApiParserTable extends JPanel
             return;
         }
 
-        List<OpenApiParserModel.OperationContext> payload;
+        List<OpenApiSamplerModel.OperationContext> payload;
         if (action == SelectionAction.SELECT_ALL
                 || action == SelectionAction.CLEAR_SELECTION
                 || action == SelectionAction.SEND_VISIBLE_TO_REPEATER)
@@ -515,7 +526,7 @@ public final class OpenApiParserTable extends JPanel
             }
 
             int modelRow = owner.convertRowIndexToModel(editingRow);
-            OpenApiParserModel.OperationContext operation = model.getAt(modelRow);
+            OpenApiSamplerModel.OperationContext operation = model.getAt(modelRow);
             if (operation != null)
             {
                 listener.onAction(action, operation);
@@ -590,7 +601,7 @@ public final class OpenApiParserTable extends JPanel
                 "Copy as Python"
         };
 
-        private final List<OpenApiParserModel.OperationContext> data = new ArrayList<>();
+        private final List<OpenApiSamplerModel.OperationContext> data = new ArrayList<>();
 
         @Override
         public int getRowCount()
@@ -619,7 +630,7 @@ public final class OpenApiParserTable extends JPanel
         @Override
         public Object getValueAt(int rowIndex, int columnIndex)
         {
-            OpenApiParserModel.OperationContext row = data.get(rowIndex);
+            OpenApiSamplerModel.OperationContext row = data.get(rowIndex);
 
             return switch (columnIndex)
             {
@@ -636,7 +647,7 @@ public final class OpenApiParserTable extends JPanel
             };
         }
 
-        public void setData(List<OpenApiParserModel.OperationContext> rows)
+        public void setData(List<OpenApiSamplerModel.OperationContext> rows)
         {
             data.clear();
             if (rows != null)
@@ -646,12 +657,12 @@ public final class OpenApiParserTable extends JPanel
             fireTableDataChanged();
         }
 
-        public List<OpenApiParserModel.OperationContext> data()
+        public List<OpenApiSamplerModel.OperationContext> data()
         {
             return List.copyOf(data);
         }
 
-        public OpenApiParserModel.OperationContext getAt(int index)
+        public OpenApiSamplerModel.OperationContext getAt(int index)
         {
             if (index < 0 || index >= data.size())
             {

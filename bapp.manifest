@@ -1,13 +1,14 @@
-name: OpenAPI Parser
-version: 2.0.12
+name: OpenAPI Sampler
+version: 2.0.13
 author: MelForze
-repo_url: https://github.com/melforze/openapi-parser
+repo_url: https://github.com/MelForze/OpenAPI-Sampler
 extension_type: java
-entry_point: burp.openapi.OpenApiParserExtension
+entry_point: burp.openapi.OpenApiSamplerExtension
 minimum_burp_version: 2025.1
 minimum_java_version: 17
-short_description: Parse OpenAPI/Swagger specs and generate testing requests for Burp tools.
+short_description: OpenAPI sampler for Burp with OpenAPI 3.1 support, discriminator-aware examples, and export/replay workflows.
 long_description: |
-  OpenAPI Parser loads OpenAPI 2.0/3.0/3.1 specs from file, URL, or context menu,
-  renders all operations in a searchable table, and sends generated requests directly
-  to Repeater and Intruder. It also exports cURL and Python requests.
+  OpenAPI Sampler loads OpenAPI 2.0/3.0/3.1 specifications from local files, remote URLs,
+  URL-list files, and Burp Target context menu captures. It generates schema-aware sample
+  requests (including discriminator handling), supports replay to Repeater/Intruder, and
+  exports requests as RAW HTTP, cURL, and Python requests snippets. Built against Montoya API 2026.2.
