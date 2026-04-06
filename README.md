@@ -28,10 +28,20 @@ Compared to older OpenAPI parser extensions, this project focuses on:
   - Swagger UI pages (`/swagger/index.html`, `/swagger-ui/index.html`) with fallback discovery
 - Source-aware operation view with server and search filters.
 - Request preview pane and row-level context actions.
+- Auth profiles and template variables:
+  - `Bearer`, `Basic`, `API key` (header/query), `OAuth2 Bearer`
+  - template placeholders like `{{token}}`, `{{baseUrl}}`
+- Batch runner for selected operations:
+  - configurable `RPS`, `parallelism`, `retries`
+  - summary by response class (`2xx/4xx/5xx/failed`)
+- Response schema validation:
+  - send selected operations and validate live responses against OpenAPI response schemas
 - URL-list loading quality-of-life:
   - retry with backoff on temporary failures
   - progress indicator and cancel button
   - failed-URL collection and copy helper
+- Session persistence:
+  - UI settings and loaded source list are restored on extension restart
 - Fetch guardrails:
   - response timeout and per-attempt deadline
   - maximum spec size checks (`5 MiB`)
@@ -59,7 +69,7 @@ Output JAR:
 3. Select extension type `Java`.
 4. Choose `target/openapi-sampler.jar`.
 5. Verify extension output includes:
-   - `[OpenAPI Sampler] Loaded. Version=2.0.13, Author=MelForze`
+   - `[OpenAPI Sampler] Loaded. Version=2.1.0, Author=MelForze`
 
 ## Offline / Online Usage
 
@@ -101,6 +111,12 @@ service-a,https://svc-a.example.com/v3/api-docs,team-red
 - BApp metadata: `bapp.manifest`
 - Companion metadata for submission packaging: `extensions.xml`
 - Icon asset used by companion metadata: `assets/openapi-sampler-icon.svg`
+
+## BApp Submission Assets
+
+- Submission checklist and listing notes: `docs/BAPP_SUBMISSION.md`
+- Screenshot folder and naming convention: `docs/screenshots/README.md`
+- Current release artifact after build: `target/openapi-sampler.jar`
 
 ## License
 

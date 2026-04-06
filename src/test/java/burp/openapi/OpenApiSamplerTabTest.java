@@ -25,6 +25,7 @@ import java.nio.charset.Charset;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -352,6 +353,32 @@ final class OpenApiSamplerTabTest
         {
             Files.deleteIfExists(file);
         }
+    }
+
+    @Test
+    void templateVariablesParsingAndBatchBoundsAreApplied() throws Exception
+    {
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
+        JTextField templateVarsField = (JTextField) field(tab, "templateVarsField");
+        templateVarsField.setText("token=abc; env=prod; baseUrl=https://api.example");
+
+        @SuppressWarnings("unchecked")
+        Map<String, String> vars = (Map<String, String>) invoke(
+                tab,
+                "templateVariablesSnapshot",
+                new Class<?>[]{String.class},
+                "(Operation default)"
+        );
+        assertEquals("abc", vars.get("token"));
+        assertEquals("prod", vars.get("env"));
+        assertEquals("https://api.example", vars.get("baseUrl"));
+
+        int clampedMin = (Integer) invoke(tab, "parseBoundedInt", new Class<?>[]{String.class, int.class, int.class, int.class}, "-10", 4, 1, 10);
+        int clampedMax = (Integer) invoke(tab, "parseBoundedInt", new Class<?>[]{String.class, int.class, int.class, int.class}, "99", 4, 1, 10);
+        int fallback = (Integer) invoke(tab, "parseBoundedInt", new Class<?>[]{String.class, int.class, int.class, int.class}, "bad", 4, 1, 10);
+        assertEquals(1, clampedMin);
+        assertEquals(10, clampedMax);
+        assertEquals(4, fallback);
     }
 
     @Test

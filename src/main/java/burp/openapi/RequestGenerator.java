@@ -17,6 +17,7 @@ import io.swagger.v3.oas.models.parameters.RequestBody;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -27,6 +28,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Converts OpenAPI operations into concrete Burp HttpRequest objects with generated examples.
@@ -35,19 +38,86 @@ public final class RequestGenerator
 {
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     private static final int MAX_ARRAY_EXAMPLES = 3;
+    private static final Pattern TEMPLATE_PATTERN = Pattern.compile("\\{\\{\\s*([A-Za-z0-9_.-]+)\\s*}}");
+
+    public enum AuthType
+    {
+        NONE,
+        BEARER,
+        BASIC,
+        API_KEY_HEADER,
+        API_KEY_QUERY,
+        OAUTH2_BEARER
+    }
+
+    public record AuthProfile(AuthType type, String key, String value)
+    {
+        public static AuthProfile none()
+        {
+            return new AuthProfile(AuthType.NONE, "", "");
+        }
+
+        public AuthProfile
+        {
+            type = type == null ? AuthType.NONE : type;
+            key = Utils.coalesce(key);
+            value = Utils.coalesce(value);
+        }
+    }
+
+    public record GenerationOptions(AuthProfile authProfile, Map<String, String> templateVariables)
+    {
+        public static GenerationOptions defaults()
+        {
+            return new GenerationOptions(AuthProfile.none(), Map.of());
+        }
+
+        public GenerationOptions
+        {
+            authProfile = authProfile == null ? AuthProfile.none() : authProfile;
+            if (templateVariables == null || templateVariables.isEmpty())
+            {
+                templateVariables = Map.of();
+            }
+            else
+            {
+                Map<String, String> normalized = new LinkedHashMap<>();
+                for (Map.Entry<String, String> entry : templateVariables.entrySet())
+                {
+                    if (entry == null || Utils.isBlank(entry.getKey()))
+                    {
+                        continue;
+                    }
+                    normalized.put(entry.getKey().trim(), Utils.coalesce(entry.getValue()));
+                }
+                templateVariables = Map.copyOf(normalized);
+            }
+        }
+    }
 
     public HttpRequest generate(
             OpenApiSamplerModel.OperationContext operationContext,
             String selectedServer,
             Collection<String> globalServers)
     {
+        return generate(operationContext, selectedServer, globalServers, GenerationOptions.defaults());
+    }
+
+    public HttpRequest generate(
+            OpenApiSamplerModel.OperationContext operationContext,
+            String selectedServer,
+            Collection<String> globalServers,
+            GenerationOptions options)
+    {
         Objects.requireNonNull(operationContext, "operationContext must not be null");
+        GenerationOptions resolvedOptions = options == null ? GenerationOptions.defaults() : options;
 
         String server = Utils.stripTrailingSlash(operationContext.preferredServer(globalServers, selectedServer));
         if (Utils.isBlank(server))
         {
             server = "http://localhost";
         }
+        server = applyTemplate(server, resolvedOptions.templateVariables());
 
         final Map<String, String> pathParams = new LinkedHashMap<>();
         final Map<String, String> queryParams = new LinkedHashMap<>();
@@ -64,6 +134,7 @@ public final class RequestGenerator
 
             String in = Utils.coalesce(parameter.getIn(), "query").toLowerCase(Locale.ROOT);
             String value = parameterExampleValue(parameter);
+            value = applyTemplate(value, resolvedOptions.templateVariables());
 
             switch (in)
             {
@@ -78,36 +149,90 @@ public final class RequestGenerator
             }
         }
 
-        String resolvedPath = fillPathParams(operationContext.path(), pathParams);
+        applyAuthToParams(resolvedOptions.authProfile(), queryParams, headerParams, resolvedOptions.templateVariables());
+
+        String resolvedPath = fillPathParams(
+                applyTemplate(operationContext.path(), resolvedOptions.templateVariables()),
+                pathParams
+        );
 
         String queryString = toQueryString(queryParams);
-        String finalUrl = joinUrl(server, resolvedPath, queryString);
+        String finalUrl = applyTemplate(joinUrl(server, resolvedPath, queryString), resolvedOptions.templateVariables());
 
         BodyPayload bodyPayload = generateBody(operationContext.operation(), operationContext.requestBody(), legacyFormParams);
+        String body = applyTemplate(bodyPayload.body(), resolvedOptions.templateVariables());
+        String contentType = applyTemplate(bodyPayload.contentType(), resolvedOptions.templateVariables());
 
         HttpRequest request = HttpRequest.httpRequestFromUrl(finalUrl).withMethod(operationContext.method());
 
         for (Map.Entry<String, String> headerEntry : headerParams.entrySet())
         {
-            request = request.withAddedHeader(headerEntry.getKey(), headerEntry.getValue());
+            String headerName = applyTemplate(headerEntry.getKey(), resolvedOptions.templateVariables());
+            String headerValue = applyTemplate(headerEntry.getValue(), resolvedOptions.templateVariables());
+            request = request.withAddedHeader(headerName, headerValue);
         }
 
         if (!cookieParams.isEmpty())
         {
-            request = request.withAddedHeader("Cookie", cookieHeader(cookieParams));
+            request = request.withAddedHeader("Cookie", applyTemplate(cookieHeader(cookieParams), resolvedOptions.templateVariables()));
         }
 
-        if (Utils.nonBlank(bodyPayload.contentType()))
+        if (Utils.nonBlank(contentType))
         {
-            request = request.withAddedHeader("Content-Type", bodyPayload.contentType());
+            request = request.withAddedHeader("Content-Type", contentType);
         }
 
-        if (Utils.nonBlank(bodyPayload.body()))
+        if (Utils.nonBlank(body))
         {
-            request = request.withBody(bodyPayload.body());
+            request = request.withBody(body);
         }
 
         return request;
+    }
+
+    private void applyAuthToParams(
+            AuthProfile authProfile,
+            Map<String, String> queryParams,
+            Map<String, String> headerParams,
+            Map<String, String> templateVariables)
+    {
+        if (authProfile == null || authProfile.type() == null || authProfile.type() == AuthType.NONE)
+        {
+            return;
+        }
+
+        String key = applyTemplate(authProfile.key(), templateVariables);
+        String value = applyTemplate(authProfile.value(), templateVariables);
+        switch (authProfile.type())
+        {
+            case NONE -> {
+                // No-op.
+            }
+            case BEARER, OAUTH2_BEARER -> {
+                if (Utils.nonBlank(value))
+                {
+                    headerParams.put("Authorization", "Bearer " + value);
+                }
+            }
+            case BASIC -> {
+                String user = Utils.coalesce(key);
+                String pass = Utils.coalesce(value);
+                String encoded = Base64.getEncoder().encodeToString((user + ":" + pass).getBytes(StandardCharsets.UTF_8));
+                headerParams.put("Authorization", "Basic " + encoded);
+            }
+            case API_KEY_HEADER -> {
+                if (Utils.nonBlank(key))
+                {
+                    headerParams.put(key, value);
+                }
+            }
+            case API_KEY_QUERY -> {
+                if (Utils.nonBlank(key))
+                {
+                    queryParams.put(key, value);
+                }
+            }
+        }
     }
 
     private String fillPathParams(String pathTemplate, Map<String, String> pathParams)
@@ -366,6 +491,11 @@ public final class RequestGenerator
             return schema.getDefault();
         }
 
+        if (Boolean.TRUE.equals(schema.getNullable()))
+        {
+            // Prefer non-null deterministic sample unless null is explicitly declared above.
+        }
+
         if (schema.getEnum() != null && !schema.getEnum().isEmpty())
         {
             return schema.getEnum().get(0);
@@ -410,13 +540,23 @@ public final class RequestGenerator
         String type = Optional.ofNullable(schema.getType()).orElse("").toLowerCase(Locale.ROOT);
         return switch (type)
         {
-            case "string" -> "sample";
-            case "integer" -> 1;
-            case "number" -> 1.0;
+            case "string" -> stringSample(schema);
+            case "integer" -> integerSample(schema);
+            case "number" -> numberSample(schema);
             case "boolean" -> true;
             case "array" -> {
                 Schema<?> items = schema.getItems();
-                yield List.of(buildExampleFromSchema(items, visitedRefs));
+                int count = 1;
+                if (schema.getMinItems() != null && schema.getMinItems() > 0)
+                {
+                    count = Math.min(schema.getMinItems(), MAX_ARRAY_EXAMPLES);
+                }
+                List<Object> values = new ArrayList<>();
+                for (int i = 0; i < count; i++)
+                {
+                    values.add(buildExampleFromSchema(items, visitedRefs));
+                }
+                yield values;
             }
             case "object" -> new LinkedHashMap<>();
             default -> {
@@ -665,6 +805,121 @@ public final class RequestGenerator
         }
 
         return "sample-" + discriminator.getPropertyName();
+    }
+
+    private String applyTemplate(String input, Map<String, String> variables)
+    {
+        String text = Utils.coalesce(input);
+        if (Utils.isBlank(text) || variables == null || variables.isEmpty())
+        {
+            return text;
+        }
+
+        Matcher matcher = TEMPLATE_PATTERN.matcher(text);
+        StringBuffer out = new StringBuffer();
+        while (matcher.find())
+        {
+            String key = matcher.group(1);
+            String replacement = Utils.coalesce(variables.get(key));
+            if (Utils.isBlank(replacement))
+            {
+                replacement = matcher.group(0);
+            }
+            matcher.appendReplacement(out, Matcher.quoteReplacement(replacement));
+        }
+        matcher.appendTail(out);
+        return out.toString();
+    }
+
+    private String stringSample(Schema<?> schema)
+    {
+        String format = Utils.safeLower(Utils.coalesce(schema.getFormat()));
+        if (Utils.nonBlank(format))
+        {
+            return switch (format)
+            {
+                case "uuid" -> "00000000-0000-4000-8000-000000000001";
+                case "email" -> "user@example.com";
+                case "date-time" -> "2026-01-01T00:00:00Z";
+                case "date" -> "2026-01-01";
+                case "hostname" -> "api.example.com";
+                case "ipv4" -> "127.0.0.1";
+                case "ipv6" -> "2001:db8::1";
+                case "uri" -> "https://example.com/resource";
+                case "password" -> "ChangeMe123!";
+                default -> "sample";
+            };
+        }
+
+        String pattern = Utils.coalesce(schema.getPattern());
+        if (Utils.nonBlank(pattern))
+        {
+            return stringFromPattern(pattern);
+        }
+
+        Integer minLength = schema.getMinLength();
+        int min = minLength != null ? Math.max(1, Math.min(minLength, 32)) : 1;
+        String base = "sample-value";
+        if (base.length() >= min)
+        {
+            return base;
+        }
+        StringBuilder padded = new StringBuilder(base);
+        while (padded.length() < min)
+        {
+            padded.append('x');
+        }
+        return padded.toString();
+    }
+
+    private String stringFromPattern(String pattern)
+    {
+        String normalized = pattern.trim();
+        if (normalized.isEmpty())
+        {
+            return "sample";
+        }
+        if (normalized.equals("\\d+") || normalized.equals("^[0-9]+$"))
+        {
+            return "12345";
+        }
+        if (normalized.contains("@"))
+        {
+            return "user@example.com";
+        }
+
+        String stripped = normalized
+                .replaceAll("\\^|\\$", "")
+                .replaceAll("\\[A-Za-z]+\\+?", "sample")
+                .replaceAll("\\[0-9]+\\+?", "123")
+                .replaceAll("[\\\\().*+?{}|]", "");
+        return Utils.nonBlank(stripped) ? stripped : "sample";
+    }
+
+    private int integerSample(Schema<?> schema)
+    {
+        if (schema.getMinimum() != null)
+        {
+            return schema.getMinimum().intValue();
+        }
+        if (schema.getMaximum() != null)
+        {
+            return Math.max(0, schema.getMaximum().intValue() - 1);
+        }
+        return 1;
+    }
+
+    private double numberSample(Schema<?> schema)
+    {
+        if (schema.getMinimum() != null)
+        {
+            return schema.getMinimum().doubleValue();
+        }
+        if (schema.getMaximum() != null)
+        {
+            return Math.max(0d, schema.getMaximum().doubleValue() - 0.1d);
+        }
+        return 1.0d;
     }
 
     private String toJson(Object value)

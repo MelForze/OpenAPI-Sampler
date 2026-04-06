@@ -34,6 +34,7 @@ import javax.swing.JScrollPane;
 import javax.swing.JSplitPane;
 import javax.swing.JTextField;
 import javax.swing.SwingUtilities;
+import javax.swing.Timer;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
 import javax.swing.filechooser.FileNameExtensionFilter;
@@ -57,6 +58,7 @@ import java.util.Deque;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -94,6 +96,15 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
     private static final String STATE_FILTER_FIELD = "ui.filterField";
     private static final String STATE_SERVER = "ui.server";
     private static final String STATE_SOURCE = "ui.source";
+    private static final String STATE_AUTH_TYPE = "ui.authType";
+    private static final String STATE_AUTH_KEY = "ui.authKey";
+    private static final String STATE_AUTH_VALUE = "ui.authValue";
+    private static final String STATE_TEMPLATE_VARS = "ui.templateVars";
+    private static final String STATE_BATCH_RPS = "ui.batchRps";
+    private static final String STATE_BATCH_PARALLEL = "ui.batchParallel";
+    private static final String STATE_BATCH_RETRIES = "ui.batchRetries";
+    private static final String STATE_SOURCES = "ui.sources";
+    private static final int FILTER_DEBOUNCE_MS = 180;
     private static final Pattern URL_FIELD_PATTERN = Pattern.compile(
             "(?i)(?:\\burl\\b|\\bconfigUrl\\b|[\"']url[\"']|[\"']configUrl[\"'])\\s*[:=]\\s*[\"']([^\"']+)[\"']");
     private static final Pattern CHARSET_PATTERN = Pattern.compile("(?i)charset\\s*=\\s*([a-z0-9._-]+)");
@@ -104,6 +115,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
     private final OpenApiSamplerModel model;
     private final OpenApiSamplerTable table;
     private final RequestGenerator requestGenerator;
+    private final ResponseSchemaValidator responseSchemaValidator;
     private final ExecutorService workerPool;
     private final SpecFetcher specFetcher;
 
@@ -117,6 +129,15 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
     private final JTextField filterField;
     private final JComboBox<SourceSelection> sourceSelector;
     private final JComboBox<String> serverSelector;
+    private final JComboBox<AuthSelection> authSelector;
+    private final JTextField authKeyField;
+    private final JTextField authValueField;
+    private final JTextField templateVarsField;
+    private final JTextField batchRpsField;
+    private final JTextField batchParallelField;
+    private final JTextField batchRetriesField;
+    private final JButton runBatchButton;
+    private final JButton validateResponsesButton;
     private final JLabel statusLabel;
     private final JLabel progressLabel;
     private final JLabel requestPreviewLabel;
@@ -126,6 +147,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
     private final List<String> lastLoadFailures = new CopyOnWriteArrayList<>();
     private final Object auditLock = new Object();
     private final AtomicBoolean disposed = new AtomicBoolean(false);
+    private final Timer filterDebounceTimer;
 
     private volatile boolean loadingInProgress;
     private volatile boolean cancelRequested;
@@ -133,6 +155,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
     private volatile Audit passiveAuditTask;
     private String restoredSourceId = "";
     private String restoredServer = "";
+    private List<String> restoredSourceLocations = List.of();
 
     public OpenApiSamplerTab(MontoyaApi api)
     {
@@ -145,6 +168,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         this.model = new OpenApiSamplerModel();
         this.table = new OpenApiSamplerTable();
         this.requestGenerator = new RequestGenerator();
+        this.responseSchemaValidator = new ResponseSchemaValidator();
         this.specFetcher = specFetcher != null ? specFetcher : this::fetchViaMontoya;
         this.workerPool = Executors.newFixedThreadPool(2, runnable -> {
             Thread worker = new Thread(runnable, "openapi-sampler-worker");
@@ -166,6 +190,21 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         this.sourceSelector.addItem(SourceSelection.allSources());
         this.serverSelector = new JComboBox<>();
         this.serverSelector.addItem(DEFAULT_SERVER_ITEM);
+        this.authSelector = new JComboBox<>();
+        this.authSelector.addItem(AuthSelection.none());
+        this.authSelector.addItem(AuthSelection.bearer());
+        this.authSelector.addItem(AuthSelection.basic());
+        this.authSelector.addItem(AuthSelection.apiKeyHeader());
+        this.authSelector.addItem(AuthSelection.apiKeyQuery());
+        this.authSelector.addItem(AuthSelection.oauth2Bearer());
+        this.authKeyField = new JTextField(14);
+        this.authValueField = new JTextField(20);
+        this.templateVarsField = new JTextField(32);
+        this.batchRpsField = new JTextField("4", 4);
+        this.batchParallelField = new JTextField("2", 3);
+        this.batchRetriesField = new JTextField("1", 3);
+        this.runBatchButton = new JButton("Run batch");
+        this.validateResponsesButton = new JButton("Validate responses");
 
         this.filterField = new JTextField(32);
 
@@ -179,6 +218,8 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         this.copyFailedButton.setEnabled(false);
         this.clearFailedButton = new JButton("Clear errors");
         this.clearFailedButton.setEnabled(false);
+        this.filterDebounceTimer = new Timer(FILTER_DEBOUNCE_MS, e -> applyFilter());
+        this.filterDebounceTimer.setRepeats(false);
 
         JPanel controls = new JPanel();
         controls.setLayout(new BoxLayout(controls, BoxLayout.Y_AXIS));
@@ -199,8 +240,30 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         optionsRow.add(new JLabel("Filter:"));
         optionsRow.add(filterField);
 
+        JPanel authRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 4));
+        authRow.add(new JLabel("Auth:"));
+        authRow.add(authSelector);
+        authRow.add(new JLabel("Key/User:"));
+        authRow.add(authKeyField);
+        authRow.add(new JLabel("Value/Pass:"));
+        authRow.add(authValueField);
+
+        JPanel runRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 4));
+        runRow.add(new JLabel("Template vars:"));
+        runRow.add(templateVarsField);
+        runRow.add(new JLabel("RPS:"));
+        runRow.add(batchRpsField);
+        runRow.add(new JLabel("Parallel:"));
+        runRow.add(batchParallelField);
+        runRow.add(new JLabel("Retries:"));
+        runRow.add(batchRetriesField);
+        runRow.add(runBatchButton);
+        runRow.add(validateResponsesButton);
+
         controls.add(loadRow);
         controls.add(optionsRow);
+        controls.add(authRow);
+        controls.add(runRow);
 
         JPanel previewPanel = new JPanel(new BorderLayout(6, 6));
         previewPanel.setBorder(BorderFactory.createEmptyBorder(4, 0, 0, 0));
@@ -224,6 +287,8 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         cancelLoadButton.addActionListener(e -> requestCancelUrlListLoad());
         copyFailedButton.addActionListener(e -> copyFailedUrlsToClipboard());
         clearFailedButton.addActionListener(e -> clearLoadErrors());
+        runBatchButton.addActionListener(e -> runSelectedBatchOrVisible());
+        validateResponsesButton.addActionListener(e -> validateSelectedResponsesAction());
         sourceSelector.addActionListener(e -> {
             refreshServerSelector();
             applyFilter();
@@ -239,21 +304,21 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             @Override
             public void insertUpdate(DocumentEvent e)
             {
-                applyFilter();
+                scheduleFilterApply();
                 persistUiState();
             }
 
             @Override
             public void removeUpdate(DocumentEvent e)
             {
-                applyFilter();
+                scheduleFilterApply();
                 persistUiState();
             }
 
             @Override
             public void changedUpdate(DocumentEvent e)
             {
-                applyFilter();
+                scheduleFilterApply();
                 persistUiState();
             }
         });
@@ -278,8 +343,40 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
                 persistUiState();
             }
         });
+        authSelector.addActionListener(e -> {
+            updateAuthFieldHints();
+            persistUiState();
+        });
+        DocumentListener persistOnlyListener = new DocumentListener()
+        {
+            @Override
+            public void insertUpdate(DocumentEvent e)
+            {
+                persistUiState();
+            }
+
+            @Override
+            public void removeUpdate(DocumentEvent e)
+            {
+                persistUiState();
+            }
+
+            @Override
+            public void changedUpdate(DocumentEvent e)
+            {
+                persistUiState();
+            }
+        };
+        authKeyField.getDocument().addDocumentListener(persistOnlyListener);
+        authValueField.getDocument().addDocumentListener(persistOnlyListener);
+        templateVarsField.getDocument().addDocumentListener(persistOnlyListener);
+        batchRpsField.getDocument().addDocumentListener(persistOnlyListener);
+        batchParallelField.getDocument().addDocumentListener(persistOnlyListener);
+        batchRetriesField.getDocument().addDocumentListener(persistOnlyListener);
 
         restoreUiState();
+        updateAuthFieldHints();
+        restorePersistedSourcesAsync();
     }
 
     public String tabTitle()
@@ -301,6 +398,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
 
         cancelRequested = true;
         loadingInProgress = false;
+        filterDebounceTimer.stop();
         activeAuditTask = null;
         passiveAuditTask = null;
         autoIncludedHosts.clear();
@@ -344,6 +442,13 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         model.clear();
         sourceSelector.removeAllItems();
         serverSelector.removeAllItems();
+        authSelector.removeAllItems();
+        authKeyField.setText("");
+        authValueField.setText("");
+        templateVarsField.setText("");
+        batchRpsField.setText("");
+        batchParallelField.setText("");
+        batchRetriesField.setText("");
         filterField.setText("");
         urlField.setText("");
         requestPreviewEditor.setRequest(previewPlaceholderRequest());
@@ -1639,10 +1744,11 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
                 log("URL list item failures omitted: +" + (result.failures().size() - maxPreview));
             }
         }
-        if (loadedSpecs == 0)
+        if (loadedSpecs == 0 && !"saved-session".equals(result.sourceLabel()))
         {
             showError("URL list load result", "No OpenAPI specs were loaded. Check Event Log for item-level errors.");
         }
+        persistLoadedSources();
         persistUiState();
     }
 
@@ -1774,6 +1880,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         }
 
         log("Loaded operations: +" + addedCount + ", total=" + totalCount);
+        persistLoadedSources();
         persistUiState();
     }
 
@@ -1942,6 +2049,14 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             store.setString(STATE_FILTER_FIELD, Utils.coalesce(filterField.getText()));
             store.setString(STATE_SERVER, Utils.coalesce(selectedServer(), DEFAULT_SERVER_ITEM));
             store.setString(STATE_SOURCE, Utils.coalesce(selectedSourceId()));
+            store.setString(STATE_AUTH_TYPE, Utils.coalesce(selectedAuthSelection().id()));
+            store.setString(STATE_AUTH_KEY, Utils.coalesce(authKeyField.getText()));
+            store.setString(STATE_AUTH_VALUE, Utils.coalesce(authValueField.getText()));
+            store.setString(STATE_TEMPLATE_VARS, Utils.coalesce(templateVarsField.getText()));
+            store.setString(STATE_BATCH_RPS, Utils.coalesce(batchRpsField.getText()));
+            store.setString(STATE_BATCH_PARALLEL, Utils.coalesce(batchParallelField.getText()));
+            store.setString(STATE_BATCH_RETRIES, Utils.coalesce(batchRetriesField.getText()));
+            store.setString(STATE_SOURCES, String.join("\n", persistedSourceLocations()));
         }
         catch (Exception ex)
         {
@@ -1976,6 +2091,38 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
 
             String storedSource = Utils.coalesce(store.getString(STATE_SOURCE));
             restoredSourceId = Utils.coalesce(storedSource);
+
+            String authType = Utils.coalesce(store.getString(STATE_AUTH_TYPE));
+            selectAuthById(authType);
+            authKeyField.setText(Utils.coalesce(store.getString(STATE_AUTH_KEY)));
+            authValueField.setText(Utils.coalesce(store.getString(STATE_AUTH_VALUE)));
+            templateVarsField.setText(Utils.coalesce(store.getString(STATE_TEMPLATE_VARS)));
+
+            String batchRps = Utils.coalesce(store.getString(STATE_BATCH_RPS));
+            if (Utils.nonBlank(batchRps))
+            {
+                batchRpsField.setText(batchRps);
+            }
+            String batchParallel = Utils.coalesce(store.getString(STATE_BATCH_PARALLEL));
+            if (Utils.nonBlank(batchParallel))
+            {
+                batchParallelField.setText(batchParallel);
+            }
+            String batchRetries = Utils.coalesce(store.getString(STATE_BATCH_RETRIES));
+            if (Utils.nonBlank(batchRetries))
+            {
+                batchRetriesField.setText(batchRetries);
+            }
+
+            String sourcesRaw = Utils.coalesce(store.getString(STATE_SOURCES));
+            if (Utils.nonBlank(sourcesRaw))
+            {
+                restoredSourceLocations = sourcesRaw.lines()
+                        .map(String::trim)
+                        .filter(Utils::nonBlank)
+                        .distinct()
+                        .toList();
+            }
         }
         catch (Exception ex)
         {
@@ -1993,6 +2140,159 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         {
             return null;
         }
+    }
+
+    private List<String> persistedSourceLocations()
+    {
+        List<String> sources = new ArrayList<>();
+        for (OpenApiSamplerModel.SourceContext sourceContext : model.availableSources())
+        {
+            if (sourceContext == null)
+            {
+                continue;
+            }
+            String location = Utils.coalesce(sourceContext.location(), sourceContext.id());
+            if (Utils.nonBlank(location))
+            {
+                sources.add(location);
+            }
+        }
+        return sources.stream().distinct().toList();
+    }
+
+    private void persistLoadedSources()
+    {
+        try
+        {
+            PersistedObject store = extensionDataStore();
+            if (store == null)
+            {
+                return;
+            }
+            store.setString(STATE_SOURCES, String.join("\n", persistedSourceLocations()));
+        }
+        catch (Exception ex)
+        {
+            logError("Unable to persist loaded sources: " + ex.getMessage(), ex);
+        }
+    }
+
+    private void restorePersistedSourcesAsync()
+    {
+        List<String> sourcesToRestore = restoredSourceLocations == null ? List.of() : List.copyOf(restoredSourceLocations);
+        restoredSourceLocations = List.of();
+        if (sourcesToRestore.isEmpty() || disposed.get() || loadingInProgress)
+        {
+            return;
+        }
+
+        loadingInProgress = true;
+        cancelRequested = false;
+        progressLabel.setText("Progress: restoring saved sources...");
+        setLoadingState(true, "Restoring saved OpenAPI sources...");
+
+        CompletableFuture
+                .supplyAsync(() -> {
+                    try
+                    {
+                        return fetchAndParseFromPersistedSources(sourcesToRestore);
+                    }
+                    catch (Exception ex)
+                    {
+                        throw new CompletionException(ex);
+                    }
+                }, workerPool)
+                .whenComplete((result, throwable) -> SwingUtilities.invokeLater(() -> {
+                    if (disposed.get())
+                    {
+                        return;
+                    }
+                    loadingInProgress = false;
+                    cancelRequested = false;
+                    setLoadingState(false, null);
+
+                    if (throwable != null)
+                    {
+                        Throwable root = unwrap(throwable);
+                        progressLabel.setText("Progress: failed");
+                        logError("Saved source restore failed: " + root.getMessage(), toException(root));
+                        return;
+                    }
+
+                    progressLabel.setText("Progress: done");
+                    applyBatchParseOutcome(result);
+                    statusLabel.setText("Session restored: loaded " + result.outcomes().size()
+                            + " source(s), failed " + result.failures().size() + ".");
+                }));
+    }
+
+    private BatchLoadResult fetchAndParseFromPersistedSources(List<String> sources) throws Exception
+    {
+        if (sources == null || sources.isEmpty())
+        {
+            return new BatchLoadResult(List.of(), List.of(), 0, 0, 0, 0, "saved-session", 0, false);
+        }
+
+        List<ParseOutcome> outcomes = new ArrayList<>();
+        List<String> failures = new ArrayList<>();
+        int processed = 0;
+        boolean canceled = false;
+
+        for (String source : sources)
+        {
+            if (cancelRequested || disposed.get())
+            {
+                canceled = true;
+                break;
+            }
+            publishUrlListProgress(processed, sources.size(), "Restoring " + source);
+            try
+            {
+                if (Utils.looksLikeHttpUrl(source))
+                {
+                    outcomes.add(fetchAndParseFromUrl(source));
+                }
+                else
+                {
+                    outcomes.add(parseFromLocalSource(source));
+                }
+            }
+            catch (Exception ex)
+            {
+                failures.add(source + " -> " + Utils.coalesce(ex.getMessage(), ex.getClass().getSimpleName()));
+                registerLoadFailure(source, Utils.coalesce(ex.getMessage(), ex.getClass().getSimpleName()));
+            }
+            processed++;
+            publishUrlListProgress(processed, sources.size(), "Restored " + source);
+        }
+
+        return new BatchLoadResult(
+                outcomes,
+                failures,
+                sources.size(),
+                sources.size(),
+                0,
+                0,
+                "saved-session",
+                processed,
+                canceled
+        );
+    }
+
+    private ParseOutcome parseFromLocalSource(String source) throws Exception
+    {
+        Path path;
+        if (source.startsWith("file:"))
+        {
+            path = Path.of(URI.create(source));
+        }
+        else
+        {
+            path = Path.of(source);
+        }
+        String content = readSpecFileContent(path);
+        String sourceLabel = path.getFileName() != null ? path.getFileName().toString() : path.toString();
+        return parseSpec(content, sourceLabel, path.toUri().toString(), true);
     }
 
     private Throwable unwrap(Throwable throwable)
@@ -2061,6 +2361,15 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
 
         statusLabel.setText("Showing " + filtered.size() + " / " + model.operations().size() + " operation(s)");
         refreshRequestPreviewFromSelection();
+    }
+
+    private void scheduleFilterApply()
+    {
+        if (disposed.get())
+        {
+            return;
+        }
+        filterDebounceTimer.restart();
     }
 
     private void refreshSourceSelector()
@@ -2132,7 +2441,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
     {
         try
         {
-            HttpRequest request = requestGenerator.generate(operationContext, selectedServer(), fallbackServersForOperation(operationContext));
+            HttpRequest request = generateRequest(operationContext);
             requestPreviewEditor.setRequest(request);
             requestPreviewLabel.setText("Request preview: " + operationContext.method() + " " + operationContext.path());
         }
@@ -2158,7 +2467,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
     {
         try
         {
-            HttpRequest request = requestGenerator.generate(operationContext, selectedServer(), fallbackServersForOperation(operationContext));
+            HttpRequest request = generateRequest(operationContext);
 
             switch (action)
             {
@@ -2207,7 +2516,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         {
             try
             {
-                HttpRequest request = requestGenerator.generate(operation, selectedServer(), fallbackServersForOperation(operation));
+                HttpRequest request = generateRequest(operation);
                 String tabName = repeaterTabName("All", operation, request);
                 api.repeater().sendToRepeater(request, tabName);
                 sent++;
@@ -2260,6 +2569,20 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
                     return;
                 }
                 sendSelectedToAudit(selected, false);
+            }
+            case RUN_SELECTED_BATCH -> {
+                if (!ensureSelectionForPopup(selected, "Run selected batch"))
+                {
+                    return;
+                }
+                runBatch(selected);
+            }
+            case VALIDATE_SELECTED_RESPONSES -> {
+                if (!ensureSelectionForPopup(selected, "Validate selected responses"))
+                {
+                    return;
+                }
+                validateSelectedResponses(selected);
             }
             case COPY_SELECTED_AS_CURL -> {
                 if (!ensureSelectionForPopup(selected, "Copy selected as cURL"))
@@ -2328,6 +2651,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         refreshSourceSelector();
         refreshServerSelector();
         applyFilter();
+        persistLoadedSources();
         statusLabel.setText("Removed " + removed + " operation(s).");
         log("Removed selected operations: " + removed);
     }
@@ -2340,7 +2664,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         {
             try
             {
-                HttpRequest request = requestGenerator.generate(operation, selectedServer(), fallbackServersForOperation(operation));
+                HttpRequest request = generateRequest(operation);
                 String tabName = repeaterTabName("Selected", operation, request);
                 api.repeater().sendToRepeater(request, tabName);
                 sent++;
@@ -2406,7 +2730,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         {
             try
             {
-                HttpRequest request = requestGenerator.generate(operation, selectedServer(), fallbackServersForOperation(operation));
+                HttpRequest request = generateRequest(operation);
                 api.intruder().sendToIntruder(request);
                 sent++;
             }
@@ -2421,6 +2745,314 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         log("Selected requests sent to Intruder. Sent=" + sent + ", Failed=" + failed);
     }
 
+    private void runSelectedBatchOrVisible()
+    {
+        List<OpenApiSamplerModel.OperationContext> selected = table.selectedOperations();
+        if (selected.isEmpty())
+        {
+            selected = table.visibleOperations();
+        }
+        if (selected.isEmpty())
+        {
+            showError("No operations", "Select one or more rows, or keep visible rows in the table.");
+            return;
+        }
+        runBatch(selected);
+    }
+
+    private void validateSelectedResponsesAction()
+    {
+        List<OpenApiSamplerModel.OperationContext> selected = table.selectedOperations();
+        if (selected.isEmpty())
+        {
+            showError("No selection", "Select one or more rows first.");
+            return;
+        }
+        validateSelectedResponses(selected);
+    }
+
+    private void runBatch(List<OpenApiSamplerModel.OperationContext> selected)
+    {
+        if (selected == null || selected.isEmpty() || disposed.get())
+        {
+            return;
+        }
+
+        BatchSettings settings = parseBatchSettings();
+        String selectedServerSnapshot = selectedServer();
+        RequestGenerator.GenerationOptions options = generationOptionsSnapshot();
+        statusLabel.setText("Batch runner: queued " + selected.size() + " request(s)...");
+        workerPool.submit(() -> executeBatch(selected, selectedServerSnapshot, settings, options));
+    }
+
+    private void executeBatch(
+            List<OpenApiSamplerModel.OperationContext> selected,
+            String selectedServerSnapshot,
+            BatchSettings settings,
+            RequestGenerator.GenerationOptions options)
+    {
+        if (selected == null || selected.isEmpty())
+        {
+            return;
+        }
+
+        ExecutorService batchExecutor = Executors.newFixedThreadPool(settings.parallelism(), runnable -> {
+            Thread worker = new Thread(runnable, "openapi-sampler-batch");
+            worker.setDaemon(true);
+            return worker;
+        });
+        SimpleRateLimiter rateLimiter = new SimpleRateLimiter(settings.requestsPerSecond());
+
+        java.util.concurrent.atomic.AtomicInteger ok2xx = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicInteger err4xx = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicInteger err5xx = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicInteger other = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicInteger failed = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicInteger processed = new java.util.concurrent.atomic.AtomicInteger();
+
+        long startedAt = System.currentTimeMillis();
+        List<java.util.concurrent.Future<?>> futures = new ArrayList<>();
+        for (OpenApiSamplerModel.OperationContext operation : selected)
+        {
+            futures.add(batchExecutor.submit(() -> {
+                try
+                {
+                    HttpRequest request = generateRequest(operation, selectedServerSnapshot, options);
+                    short statusCode = sendRequestWithRetry(request, settings, rateLimiter);
+                    if (statusCode >= 200 && statusCode <= 299)
+                    {
+                        ok2xx.incrementAndGet();
+                    }
+                    else if (statusCode >= 400 && statusCode <= 499)
+                    {
+                        err4xx.incrementAndGet();
+                    }
+                    else if (statusCode >= 500 && statusCode <= 599)
+                    {
+                        err5xx.incrementAndGet();
+                    }
+                    else
+                    {
+                        other.incrementAndGet();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    failed.incrementAndGet();
+                    logError("Batch request failed for " + operation.method() + " " + operation.path() + ": " + ex.getMessage(), ex);
+                }
+                finally
+                {
+                    int done = processed.incrementAndGet();
+                    if (done % 25 == 0 || done == selected.size())
+                    {
+                        int finalDone = done;
+                        SwingUtilities.invokeLater(() ->
+                                progressLabel.setText("Progress: batch " + finalDone + "/" + selected.size()));
+                    }
+                }
+            }));
+        }
+
+        waitForFutures(futures);
+        batchExecutor.shutdownNow();
+
+        long elapsedMs = System.currentTimeMillis() - startedAt;
+        int total = selected.size();
+        int ok = ok2xx.get();
+        int c4 = err4xx.get();
+        int c5 = err5xx.get();
+        int otherCount = other.get();
+        int failCount = failed.get();
+        SwingUtilities.invokeLater(() -> statusLabel.setText(
+                "Batch done: total=" + total
+                        + ", 2xx=" + ok
+                        + ", 4xx=" + c4
+                        + ", 5xx=" + c5
+                        + ", other=" + otherCount
+                        + ", failed=" + failCount
+                        + ", " + elapsedMs + " ms"));
+        log("Batch runner completed. Total=" + total
+                + ", 2xx=" + ok
+                + ", 4xx=" + c4
+                + ", 5xx=" + c5
+                + ", Other=" + otherCount
+                + ", Failed=" + failCount
+                + ", ElapsedMs=" + elapsedMs
+                + ", RPS=" + settings.requestsPerSecond()
+                + ", Parallel=" + settings.parallelism()
+                + ", Retries=" + settings.retries());
+    }
+
+    private void validateSelectedResponses(List<OpenApiSamplerModel.OperationContext> selected)
+    {
+        if (selected == null || selected.isEmpty() || disposed.get())
+        {
+            return;
+        }
+        String selectedServerSnapshot = selectedServer();
+        RequestGenerator.GenerationOptions options = generationOptionsSnapshot();
+        statusLabel.setText("Response validation: running for " + selected.size() + " operation(s)...");
+        workerPool.submit(() -> executeResponseValidation(selected, selectedServerSnapshot, options));
+    }
+
+    private void executeResponseValidation(
+            List<OpenApiSamplerModel.OperationContext> selected,
+            String selectedServerSnapshot,
+            RequestGenerator.GenerationOptions options)
+    {
+        int valid = 0;
+        int invalid = 0;
+        int skipped = 0;
+        int failed = 0;
+
+        for (OpenApiSamplerModel.OperationContext operation : selected)
+        {
+            HttpRequest request;
+            try
+            {
+                request = generateRequest(operation, selectedServerSnapshot, options);
+            }
+            catch (Exception ex)
+            {
+                failed++;
+                logError("Validation request generation failed for " + operation.method() + " " + operation.path() + ": " + ex.getMessage(), ex);
+                continue;
+            }
+
+            try
+            {
+                RequestOptions requestOptions = RequestOptions.requestOptions().withResponseTimeout(RESPONSE_TIMEOUT_MS);
+                HttpRequestResponse response = api.http().sendRequest(request, requestOptions);
+                if (response == null || !response.hasResponse() || response.response() == null)
+                {
+                    failed++;
+                    log("Validation skipped (no response): " + operation.method() + " " + operation.path());
+                    continue;
+                }
+
+                ResponseSchemaValidator.ValidationResult validation =
+                        responseSchemaValidator.validate(operation, response.response());
+                if (validation.skipped())
+                {
+                    skipped++;
+                }
+                else if (validation.valid())
+                {
+                    valid++;
+                }
+                else
+                {
+                    invalid++;
+                    if (!validation.errors().isEmpty())
+                    {
+                        log("Schema mismatch for " + operation.method() + " " + operation.path() + ": " + validation.errors().get(0));
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                failed++;
+                logError("Response validation failed for " + operation.method() + " " + operation.path() + ": " + ex.getMessage(), ex);
+            }
+        }
+
+        int finalValid = valid;
+        int finalInvalid = invalid;
+        int finalSkipped = skipped;
+        int finalFailed = failed;
+        SwingUtilities.invokeLater(() ->
+                statusLabel.setText("Validation done: valid=" + finalValid
+                        + ", invalid=" + finalInvalid
+                        + ", skipped=" + finalSkipped
+                        + ", failed=" + finalFailed + "."));
+        log("Response validation completed. Valid=" + finalValid
+                + ", Invalid=" + finalInvalid
+                + ", Skipped=" + finalSkipped
+                + ", Failed=" + finalFailed);
+    }
+
+    private short sendRequestWithRetry(
+            HttpRequest request,
+            BatchSettings settings,
+            SimpleRateLimiter rateLimiter) throws Exception
+    {
+        int maxAttempts = Math.max(1, settings.retries() + 1);
+        Exception lastError = null;
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            rateLimiter.acquire();
+            try
+            {
+                RequestOptions requestOptions = RequestOptions.requestOptions().withResponseTimeout(RESPONSE_TIMEOUT_MS);
+                HttpRequestResponse response = api.http().sendRequest(request, requestOptions);
+                if (response == null || !response.hasResponse() || response.response() == null)
+                {
+                    throw new IOException("No response received");
+                }
+                short statusCode = response.response().statusCode();
+                if (statusCode >= 500 && statusCode <= 599 && attempt < maxAttempts)
+                {
+                    continue;
+                }
+                return statusCode;
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+                if (attempt >= maxAttempts)
+                {
+                    break;
+                }
+            }
+        }
+        throw lastError == null ? new IOException("Request failed") : lastError;
+    }
+
+    private void waitForFutures(List<java.util.concurrent.Future<?>> futures)
+    {
+        if (futures == null)
+        {
+            return;
+        }
+        for (java.util.concurrent.Future<?> future : futures)
+        {
+            if (future == null)
+            {
+                continue;
+            }
+            try
+            {
+                future.get();
+            }
+            catch (Exception ignored)
+            {
+                // Error accounting is handled by each task.
+            }
+        }
+    }
+
+    private BatchSettings parseBatchSettings()
+    {
+        int rps = parseBoundedInt(batchRpsField.getText(), 4, 1, 200);
+        int parallel = parseBoundedInt(batchParallelField.getText(), 2, 1, 16);
+        int retries = parseBoundedInt(batchRetriesField.getText(), 1, 0, 10);
+        return new BatchSettings(rps, parallel, retries);
+    }
+
+    private int parseBoundedInt(String raw, int fallback, int min, int max)
+    {
+        try
+        {
+            int parsed = Integer.parseInt(Utils.coalesce(raw));
+            return Math.max(min, Math.min(max, parsed));
+        }
+        catch (Exception ignored)
+        {
+            return fallback;
+        }
+    }
+
     private void sendSelectedToAudit(List<OpenApiSamplerModel.OperationContext> selected, boolean active)
     {
         if (disposed.get())
@@ -2433,11 +3065,17 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         }
 
         String mode = active ? "Active" : "Passive";
+        String selectedServerSnapshot = selectedServer();
+        RequestGenerator.GenerationOptions options = generationOptionsSnapshot();
         statusLabel.setText(mode + " scan: queuing " + selected.size() + " request(s)...");
-        workerPool.submit(() -> queueSelectedForAudit(selected, active));
+        workerPool.submit(() -> queueSelectedForAudit(selected, active, selectedServerSnapshot, options));
     }
 
-    private void queueSelectedForAudit(List<OpenApiSamplerModel.OperationContext> selected, boolean active)
+    private void queueSelectedForAudit(
+            List<OpenApiSamplerModel.OperationContext> selected,
+            boolean active,
+            String selectedServerSnapshot,
+            RequestGenerator.GenerationOptions options)
     {
         String mode = active ? "Active" : "Passive";
         Audit audit;
@@ -2468,7 +3106,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             HttpRequest request;
             try
             {
-                request = requestGenerator.generate(operation, selectedServer(), fallbackServersForOperation(operation));
+                request = generateRequest(operation, selectedServerSnapshot, options);
                 autoIncluded += autoIncludeRequestHostInScope(request);
             }
             catch (Exception ex)
@@ -2702,7 +3340,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         {
             try
             {
-                HttpRequest request = requestGenerator.generate(operation, selectedServer(), fallbackServersForOperation(operation));
+                HttpRequest request = generateRequest(operation);
                 if (all.length() > 0)
                 {
                     all.append("\n\n# ----------------------------------------\n\n");
@@ -2736,7 +3374,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         {
             try
             {
-                HttpRequest request = requestGenerator.generate(operation, selectedServer(), fallbackServersForOperation(operation));
+                HttpRequest request = generateRequest(operation);
                 if (all.length() > 0)
                 {
                     all.append("\n\n# ========================================\n\n");
@@ -2819,7 +3457,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             HttpRequest request;
             try
             {
-                request = requestGenerator.generate(operation, selectedServer(), fallbackServersForOperation(operation));
+                request = generateRequest(operation);
             }
             catch (Exception ex)
             {
@@ -2870,6 +3508,133 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
     {
         Object selected = serverSelector.getSelectedItem();
         return selected == null ? DEFAULT_SERVER_ITEM : String.valueOf(selected);
+    }
+
+    private AuthSelection selectedAuthSelection()
+    {
+        Object selected = authSelector.getSelectedItem();
+        if (selected instanceof AuthSelection authSelection)
+        {
+            return authSelection;
+        }
+        return AuthSelection.none();
+    }
+
+    private RequestGenerator.AuthProfile selectedAuthProfile()
+    {
+        AuthSelection selection = selectedAuthSelection();
+        return new RequestGenerator.AuthProfile(
+                selection.authType(),
+                Utils.coalesce(authKeyField.getText()),
+                Utils.coalesce(authValueField.getText())
+        );
+    }
+
+    private void selectAuthById(String id)
+    {
+        String target = Utils.coalesce(id);
+        if (Utils.isBlank(target))
+        {
+            authSelector.setSelectedIndex(0);
+            return;
+        }
+        for (int i = 0; i < authSelector.getItemCount(); i++)
+        {
+            AuthSelection authSelection = authSelector.getItemAt(i);
+            if (authSelection != null && target.equals(authSelection.id()))
+            {
+                authSelector.setSelectedIndex(i);
+                return;
+            }
+        }
+        authSelector.setSelectedIndex(0);
+    }
+
+    private void updateAuthFieldHints()
+    {
+        AuthSelection selection = selectedAuthSelection();
+        if (selection.authType() == RequestGenerator.AuthType.BASIC)
+        {
+            authKeyField.setToolTipText("Username (supports templates like {{user}})");
+            authValueField.setToolTipText("Password (supports templates like {{pass}})");
+            return;
+        }
+        if (selection.authType() == RequestGenerator.AuthType.API_KEY_HEADER
+                || selection.authType() == RequestGenerator.AuthType.API_KEY_QUERY)
+        {
+            authKeyField.setToolTipText("API key parameter/header name");
+            authValueField.setToolTipText("API key value");
+            return;
+        }
+        if (selection.authType() == RequestGenerator.AuthType.BEARER
+                || selection.authType() == RequestGenerator.AuthType.OAUTH2_BEARER)
+        {
+            authKeyField.setToolTipText("Optional token alias/ignored");
+            authValueField.setToolTipText("Bearer access token");
+            return;
+        }
+        authKeyField.setToolTipText("Auth key/user");
+        authValueField.setToolTipText("Auth value/password/token");
+    }
+
+    private Map<String, String> templateVariablesSnapshot(String defaultServer)
+    {
+        Map<String, String> variables = new java.util.LinkedHashMap<>();
+        String source = Utils.coalesce(templateVarsField.getText());
+        if (Utils.nonBlank(source))
+        {
+            String[] tokens = source.split("[;\\n,]");
+            for (String token : tokens)
+            {
+                if (Utils.isBlank(token))
+                {
+                    continue;
+                }
+                String[] parts = token.split("=", 2);
+                if (parts.length != 2)
+                {
+                    continue;
+                }
+                String key = Utils.coalesce(parts[0]);
+                String value = Utils.coalesce(parts[1]);
+                if (Utils.nonBlank(key))
+                {
+                    variables.put(key, value);
+                }
+            }
+        }
+        if (Utils.nonBlank(defaultServer) && !DEFAULT_SERVER_ITEM.equals(defaultServer))
+        {
+            variables.putIfAbsent("baseUrl", defaultServer);
+        }
+        return variables;
+    }
+
+    private RequestGenerator.GenerationOptions generationOptionsSnapshot()
+    {
+        String server = selectedServer();
+        return new RequestGenerator.GenerationOptions(
+                selectedAuthProfile(),
+                templateVariablesSnapshot(server)
+        );
+    }
+
+    private HttpRequest generateRequest(OpenApiSamplerModel.OperationContext operationContext)
+    {
+        return generateRequest(operationContext, selectedServer(), generationOptionsSnapshot());
+    }
+
+    private HttpRequest generateRequest(
+            OpenApiSamplerModel.OperationContext operationContext,
+            String selectedServerSnapshot,
+            RequestGenerator.GenerationOptions options)
+    {
+        return requestGenerator.generate(
+                operationContext,
+                selectedServerSnapshot,
+                fallbackServersForOperation(operationContext),
+                options
+        );
     }
 
     private List<String> fallbackServersForOperation(OpenApiSamplerModel.OperationContext operationContext)
@@ -2941,12 +3706,40 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
     {
     }
 
-    record FetchResponse(
-            short statusCode,
-            byte[] bodyBytes,
-            String contentType,
-            long contentLength)
+    static final class FetchResponse
     {
+        private final short statusCode;
+        private final byte[] bodyBytes;
+        private final String contentType;
+        private final long contentLength;
+
+        FetchResponse(short statusCode, byte[] bodyBytes, String contentType, long contentLength)
+        {
+            this.statusCode = statusCode;
+            this.bodyBytes = bodyBytes == null ? new byte[0] : bodyBytes.clone();
+            this.contentType = Utils.coalesce(contentType);
+            this.contentLength = contentLength;
+        }
+
+        short statusCode()
+        {
+            return statusCode;
+        }
+
+        byte[] bodyBytes()
+        {
+            return bodyBytes.clone();
+        }
+
+        String contentType()
+        {
+            return contentType;
+        }
+
+        long contentLength()
+        {
+            return contentLength;
+        }
     }
 
     private record BomDecode(String charsetName, int offset)
@@ -2955,6 +3748,42 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
 
     private record ExportDocument(String content, int exported, int failed)
     {
+    }
+
+    private record BatchSettings(int requestsPerSecond, int parallelism, int retries)
+    {
+    }
+
+    private static final class SimpleRateLimiter
+    {
+        private final long intervalNanos;
+        private long nextAllowedTime;
+
+        private SimpleRateLimiter(int requestsPerSecond)
+        {
+            int safeRps = Math.max(1, requestsPerSecond);
+            this.intervalNanos = 1_000_000_000L / safeRps;
+            this.nextAllowedTime = System.nanoTime();
+        }
+
+        private synchronized void acquire()
+        {
+            long now = System.nanoTime();
+            long waitNanos = nextAllowedTime - now;
+            if (waitNanos > 0)
+            {
+                try
+                {
+                    TimeUnit.NANOSECONDS.sleep(waitNanos);
+                }
+                catch (InterruptedException interrupted)
+                {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            long reference = Math.max(System.nanoTime(), nextAllowedTime);
+            nextAllowedTime = reference + intervalNanos;
+        }
     }
 
     @FunctionalInterface
@@ -3017,6 +3846,45 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         public String toString()
         {
             return Utils.coalesce(label, DEFAULT_SOURCE_ITEM);
+        }
+    }
+
+    private record AuthSelection(String id, String label, RequestGenerator.AuthType authType)
+    {
+        private static AuthSelection none()
+        {
+            return new AuthSelection("none", "None", RequestGenerator.AuthType.NONE);
+        }
+
+        private static AuthSelection bearer()
+        {
+            return new AuthSelection("bearer", "Bearer", RequestGenerator.AuthType.BEARER);
+        }
+
+        private static AuthSelection basic()
+        {
+            return new AuthSelection("basic", "Basic", RequestGenerator.AuthType.BASIC);
+        }
+
+        private static AuthSelection apiKeyHeader()
+        {
+            return new AuthSelection("api_key_header", "API Key (Header)", RequestGenerator.AuthType.API_KEY_HEADER);
+        }
+
+        private static AuthSelection apiKeyQuery()
+        {
+            return new AuthSelection("api_key_query", "API Key (Query)", RequestGenerator.AuthType.API_KEY_QUERY);
+        }
+
+        private static AuthSelection oauth2Bearer()
+        {
+            return new AuthSelection("oauth2_bearer", "OAuth2 Bearer", RequestGenerator.AuthType.OAUTH2_BEARER);
+        }
+
+        @Override
+        public String toString()
+        {
+            return Utils.coalesce(label, "None");
         }
     }
 

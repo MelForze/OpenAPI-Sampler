@@ -17,6 +17,7 @@ import io.swagger.v3.oas.models.parameters.RequestBody;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -480,6 +481,107 @@ final class RequestGeneratorTest
         int occurrences = body.split("tag", -1).length - 1;
         assertTrue(occurrences >= 3);
         assertTrue(occurrences <= 4); // pretty JSON adds quotes, but array count is capped to 3 items
+    }
+
+    @Test
+    void authProfileAndTemplateVariablesAreAppliedToRequest()
+    {
+        RequestGenerator generator = new RequestGenerator();
+        List<Parameter> parameters = List.of(
+                new Parameter().in("path").name("tenant").example("{{tenant}}"),
+                new Parameter().in("query").name("trace").example("{{trace}}"),
+                new Parameter().in("header").name("X-Env").example("{{env}}")
+        );
+
+        OpenApiSamplerModel.OperationContext context = context(
+                "GET",
+                "/{{region}}/accounts/{tenant}",
+                List.of("https://{{baseHost}}"),
+                parameters,
+                null,
+                new Operation()
+        );
+
+        RequestGenerator.GenerationOptions options = new RequestGenerator.GenerationOptions(
+                new RequestGenerator.AuthProfile(RequestGenerator.AuthType.BEARER, "", "{{token}}"),
+                Map.of(
+                        "baseHost", "api.example",
+                        "region", "eu",
+                        "tenant", "acme",
+                        "trace", "trace-1",
+                        "env", "prod",
+                        "token", "token-123"
+                )
+        );
+
+        HttpRequest request = generator.generate(context, DEFAULT_SERVER, List.of(), options);
+        String raw = request.toString();
+        assertTrue(request.url().startsWith("https://api.example/eu/accounts/acme"));
+        assertTrue(request.url().contains("trace=trace-1"));
+        assertTrue(raw.contains("X-Env: prod"));
+        assertTrue(raw.contains("Authorization: Bearer token-123"));
+    }
+
+    @Test
+    void basicAndApiKeyQueryAuthProfilesAreApplied()
+    {
+        RequestGenerator generator = new RequestGenerator();
+        OpenApiSamplerModel.OperationContext context = context(
+                "GET",
+                "/secure",
+                List.of("https://api.example"),
+                List.of(),
+                null,
+                new Operation()
+        );
+
+        RequestGenerator.GenerationOptions basicOptions = new RequestGenerator.GenerationOptions(
+                new RequestGenerator.AuthProfile(RequestGenerator.AuthType.BASIC, "alice", "wonderland"),
+                Map.of()
+        );
+        HttpRequest basicRequest = generator.generate(context, DEFAULT_SERVER, List.of(), basicOptions);
+        String encoded = Base64.getEncoder().encodeToString("alice:wonderland".getBytes());
+        assertTrue(basicRequest.toString().contains("Authorization: Basic " + encoded));
+
+        RequestGenerator.GenerationOptions queryOptions = new RequestGenerator.GenerationOptions(
+                new RequestGenerator.AuthProfile(RequestGenerator.AuthType.API_KEY_QUERY, "api_key", "q-1"),
+                Map.of()
+        );
+        HttpRequest queryRequest = generator.generate(context, DEFAULT_SERVER, List.of(), queryOptions);
+        assertTrue(queryRequest.url().contains("api_key=q-1"));
+    }
+
+    @Test
+    void smartSchemaGenerationUsesFormatPatternAndNumericBounds()
+    {
+        RequestGenerator generator = new RequestGenerator();
+
+        ObjectSchema payload = new ObjectSchema();
+        payload.addProperty("email", new StringSchema().format("email"));
+        payload.addProperty("createdAt", new StringSchema().format("date-time"));
+        payload.addProperty("code", new StringSchema().pattern("\\d+"));
+        payload.addProperty("age", new IntegerSchema().minimum(new java.math.BigDecimal("18")));
+
+        RequestBody requestBody = new RequestBody()
+                .content(new Content().addMediaType("application/json", new MediaType().schema(payload)));
+
+        OpenApiSamplerModel.OperationContext context = context(
+                "POST",
+                "/smart",
+                List.of("https://api.example"),
+                List.of(),
+                requestBody,
+                new Operation()
+        );
+
+        HttpRequest request = generator.generate(context, DEFAULT_SERVER, List.of());
+        String body = request.bodyToString();
+        assertTrue(body.contains("user@example.com"));
+        assertTrue(body.contains("2026-01-01T00:00:00Z"));
+        assertTrue(body.contains("\"code\""));
+        assertTrue(body.contains("12345"));
+        assertTrue(body.contains("\"age\""));
+        assertTrue(body.contains("18"));
     }
 
     private OpenApiSamplerModel.OperationContext context(

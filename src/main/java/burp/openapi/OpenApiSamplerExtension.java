@@ -13,7 +13,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class OpenApiSamplerExtension implements BurpExtension, ExtensionUnloadingHandler
 {
     public static final String NAME = "OpenAPI Sampler";
-    public static final String VERSION = "2.0.13";
+    public static final String VERSION = "2.1.0";
     public static final String AUTHOR = "MelForze";
 
     private final AtomicBoolean unloaded = new AtomicBoolean(false);
