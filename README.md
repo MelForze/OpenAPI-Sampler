@@ -1,53 +1,25 @@
 # OpenAPI Sampler
 
-`OpenAPI Sampler` is a Burp Suite extension for authorized API security testing.  
-It parses OpenAPI/Swagger definitions and generates ready-to-send HTTP requests for manual assessment workflows.
+Burp Suite extension for turning OpenAPI/Swagger specs into ready-to-send HTTP requests.
 
-Use this project only in legal, authorized environments.
-
-## Why OpenAPI Sampler
-
-Compared to older OpenAPI parser extensions, this project focuses on:
-
-- OpenAPI `3.1` support (plus `2.0` and `3.0.x`)
-- Schema-aware request generation with better composed schema support:
-  - `allOf` merge behavior
-  - deterministic `oneOf` / `anyOf` branch selection
-  - discriminator-aware payload examples
-- Workflow actions for replay and export:
-  - send to Repeater / Intruder
-  - export as RAW HTTP + cURL + Python `requests`
+Use it only in legal, authorized testing environments.
 
 ## Features
 
-- Load specs from:
-  - local file (`.json`, `.yaml`, `.yml`)
-  - URL list file (`.txt`, `.list`, `.urls`, `.csv`)
-  - remote URL
-  - Burp Target context menu (`Send to OpenAPI Sampler`)
-  - Swagger UI pages (`/swagger/index.html`, `/swagger-ui/index.html`) with fallback discovery
-- Source-aware operation view with server and search filters.
-- Request and expected response preview panes, generated from OpenAPI examples/schemas.
-- Row-level context actions, including bulk server override for selected operations.
-- Auth profiles for generated requests:
-  - `Bearer`, `Basic`, `API key` (header/query), `OAuth2 Bearer`
-- URL-list loading quality-of-life:
-  - parsed operations are added to the table as each spec is fetched
-  - retry with backoff on temporary failures
-  - progress indicator and cancel button
-  - failed-URL collection and copy helper
-- Session persistence:
-  - UI settings and loaded source list are restored on extension restart
-- Fetch guardrails:
-  - response timeout and per-attempt deadline
-  - maximum spec size checks (`5 MiB`)
+- Loads OpenAPI `2.0`, `3.0.x`, and `3.1` specs from local files, URLs, URL lists, Swagger UI pages, and Burp Target context menu.
+- Generates schema-aware sample requests, including `allOf`, `oneOf`, `anyOf`, and discriminator-aware payloads.
+- Shows request preview and expected response preview from OpenAPI examples/schemas.
+- Sends generated requests to Repeater, Intruder, Active scan, and Passive scan.
+- Exports selected requests as RAW HTTP, cURL, and Python `requests`.
+- Supports auth profiles: Bearer, OAuth2 Bearer, Basic, API key header, and API key query.
+- Lets you override the server for one or more selected operations.
+- Loads URL lists incrementally, so operations appear as each spec is fetched.
 
 ## Requirements
 
-- Burp Suite: `2026.2+`
-- Java: `17+`
-- Montoya API baseline: `2026.2` (build target)
-- Maven: `3.9+` (for local build)
+- Burp Suite `2026.2+`
+- Java `17+`
+- Maven `3.9+` for local builds
 
 ## Build
 
@@ -55,69 +27,61 @@ Compared to older OpenAPI parser extensions, this project focuses on:
 mvn clean package
 ```
 
-Output JAR:
-- `target/openapi-sampler-2.2.0.jar`
+The JAR is created at:
 
-## Install in Burp
+```text
+target/openapi-sampler-2.2.0.jar
+```
 
-1. Open `Burp -> Extender -> Extensions`.
-2. Click `Add`.
-3. Select extension type `Java`.
-4. Choose `target/openapi-sampler-2.2.0.jar`.
-5. Verify extension output includes:
-   - `[OpenAPI Sampler] Loaded. Version=2.2.0, Author=MelForze`
+## Install
 
-## Offline / Online Usage
+1. Open `Extensions > Installed > Add` in Burp.
+2. Select extension type `Java`.
+3. Choose `target/openapi-sampler-2.2.0.jar`.
+4. Check the extension output for:
 
-- Offline usage is supported via local file loading.
-- Bundled sample specs are provided in:
-  - `samples/openapi-3.1-discriminator.yaml`
-  - `samples/openapi-2.0-basic.yaml`
-- Remote URL and URL-list fetch from internet/intranet endpoints requires network connectivity from Burp.
+```text
+[OpenAPI Sampler] Loaded. Version=2.2.0, Author=MelForze
+```
 
-## Quick Usage
+## Usage
 
-1. Open the `OpenAPI Sampler` tab in Burp.
-2. Load one or more OpenAPI specs.
-3. Pick source and server filters.
-4. Filter operations by method/path/tag/summary.
-5. Use context actions for replay/export operations.
+1. Open the `OpenAPI Sampler` tab.
+2. Load a spec from a file, URL, URL list, Swagger UI page, or Burp Target context menu.
+3. Select source/server filters if needed.
+4. Select operations in the table.
+5. Use right-click actions to send, export, delete, or change server for selected operations.
 
-### Request Options
+## Auth
 
-- `Auth` is optional. `Bearer` and `OAuth2 Bearer` show only `Token`; the generated request uses `Authorization: Bearer <token>`.
-- `API Key (Header)` uses `Header name` + `Value`; `API Key (Query)` uses `Query name` + `Value`.
+Auth is optional and applied only to generated requests:
 
-## URL List File Format
+- `Bearer` / `OAuth2 Bearer`: enter `Token`.
+- `Basic`: enter `Username` and `Password`.
+- `API Key (Header)`: enter `Header name` and `Value`.
+- `API Key (Query)`: enter `Query name` and `Value`.
+
+## URL List Format
 
 - One URL per line.
 - Empty lines and lines starting with `#` are ignored.
-- Supports `http://` and `https://`.
-- Bare host URLs are normalized to `https://`.
-- CSV-like lines are supported; first URL-like token is used.
-
-Example:
+- `http://` and `https://` are supported.
+- Bare hosts are normalized to `https://`.
+- CSV-like rows are supported; the first URL-like token is used.
 
 ```txt
 # production
 https://api.example.com/openapi.json
 api2.example.com/swagger/v1/swagger.yaml
 
-# csv-like rows
+# csv-like row
 service-a,https://svc-a.example.com/v3/api-docs,team-red
 ```
 
-## Metadata Files
+## Samples
 
-- BApp metadata: `bapp.manifest`
-- Companion metadata for submission packaging: `extensions.xml`
-- Icon asset used by companion metadata: `assets/openapi-sampler-icon.svg`
-
-## BApp Submission Assets
-
-- Submission checklist and listing notes: `docs/BAPP_SUBMISSION.md`
-- Screenshot folder and naming convention: `docs/screenshots/README.md`
-- Current release artifact after build: `target/openapi-sampler-2.2.0.jar`
+- `samples/openapi-3.1-discriminator.yaml`
+- `samples/openapi-2.0-basic.yaml`
 
 ## License
 
