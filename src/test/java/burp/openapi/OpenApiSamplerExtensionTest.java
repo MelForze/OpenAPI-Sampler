@@ -31,11 +31,11 @@ final class OpenApiSamplerExtensionTest
 
         extension.initialize(ctx.api);
 
-        verify(ctx.extension).setName("OpenAPI Sampler v2.1.0");
+        verify(ctx.extension).setName("OpenAPI Sampler v2.2.0");
         verify(ctx.userInterface).registerSuiteTab(eq("OpenAPI Sampler"), any(Component.class));
         verify(ctx.userInterface).registerContextMenuItemsProvider(any(ContextMenuItemsProvider.class));
         verify(ctx.extension).registerUnloadingHandler(eq(extension));
-        verify(ctx.logging).logToOutput(contains("[OpenAPI Sampler] Loaded. Version=2.1.0, Author=MelForze"));
+        verify(ctx.logging).logToOutput(contains("[OpenAPI Sampler] Loaded. Version=2.2.0, Author=MelForze"));
     }
 
     @Test

@@ -47,8 +47,7 @@ public final class OpenApiSamplerTable extends JPanel
         SEND_SELECTED_TO_INTRUDER,
         SEND_SELECTED_TO_ACTIVE_SCAN,
         SEND_SELECTED_TO_PASSIVE_SCAN,
-        RUN_SELECTED_BATCH,
-        VALIDATE_SELECTED_RESPONSES,
+        CHANGE_SELECTED_SERVER,
         COPY_SELECTED_AS_CURL,
         COPY_SELECTED_AS_PYTHON,
         EXPORT_SELECTED_REQUESTS,
@@ -413,8 +412,8 @@ public final class OpenApiSamplerTable extends JPanel
         addPopupItem(menu, "Send selected to Intruder", SelectionAction.SEND_SELECTED_TO_INTRUDER, hasSelection);
         addPopupItem(menu, "Send selected to Active scan", SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN, hasSelection);
         addPopupItem(menu, "Send selected to Passive scan", SelectionAction.SEND_SELECTED_TO_PASSIVE_SCAN, hasSelection);
-        addPopupItem(menu, "Run selected batch", SelectionAction.RUN_SELECTED_BATCH, hasSelection);
-        addPopupItem(menu, "Validate selected responses", SelectionAction.VALIDATE_SELECTED_RESPONSES, hasSelection);
+        menu.addSeparator();
+        addPopupItem(menu, "Change selected server...", SelectionAction.CHANGE_SELECTED_SERVER, hasSelection);
         menu.addSeparator();
         addPopupItem(menu, "Copy selected as cURL", SelectionAction.COPY_SELECTED_AS_CURL, hasSelection);
         addPopupItem(menu, "Copy selected as Python-Requests", SelectionAction.COPY_SELECTED_AS_PYTHON, hasSelection);

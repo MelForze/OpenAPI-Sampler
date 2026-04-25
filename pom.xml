@@ -5,7 +5,7 @@
 
     <groupId>burp.openapi</groupId>
     <artifactId>openapi-sampler</artifactId>
-    <version>2.1.0</version>
+    <version>2.2.0</version>
     <name>OpenAPI Sampler</name>
     <description>Burp extension for sampling OpenAPI/Swagger endpoints with OpenAPI 3.1 support and schema-aware examples.</description>
 
@@ -90,7 +90,7 @@
     </dependencies>
 
     <build>
-        <finalName>openapi-sampler</finalName>
+        <finalName>${project.artifactId}-${project.version}</finalName>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>

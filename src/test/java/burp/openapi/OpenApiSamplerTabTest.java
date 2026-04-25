@@ -17,17 +17,20 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import javax.swing.JComboBox;
+import javax.swing.JLabel;
 import javax.swing.JTextField;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
 
@@ -145,6 +148,44 @@ final class OpenApiSamplerTabTest
         }
         assertNotNull(thrown);
         assertTrue(Utils.nonBlank(thrown.getMessage()));
+    }
+
+    @Test
+    void parseSpecBlocksRemoteExternalRefsOwnedBySwaggerParser() throws Exception
+    {
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
+
+        String spec = """
+                openapi: 3.0.3
+                info:
+                  title: Remote ref test
+                  version: 1.0.0
+                paths:
+                  /users:
+                    post:
+                      requestBody:
+                        content:
+                          application/json:
+                            schema:
+                              $ref: 'http://127.0.0.1:9/evil.yaml#/components/schemas/User'
+                      responses:
+                        '200':
+                          description: ok
+                """;
+
+        Object parseOutcome = invoke(tab, "parseSpec",
+                new Class<?>[]{String.class, String.class, String.class, boolean.class},
+                spec, "inline", "inline", false);
+        SwaggerParseResult parseResult = (SwaggerParseResult) recordValue(parseOutcome, "parseResult");
+
+        assertNotNull(parseResult);
+        assertTrue(
+                parseResult.getMessages().stream().anyMatch(message ->
+                        message.contains("denylist")
+                                || message.contains("restricted")
+                                || message.contains("Unable to load URL ref")),
+                "remote external refs should be blocked before Swagger parser can fetch them directly"
+        );
     }
 
     @Test
@@ -356,29 +397,36 @@ final class OpenApiSamplerTabTest
     }
 
     @Test
-    void templateVariablesParsingAndBatchBoundsAreApplied() throws Exception
+    void authFieldsFollowSelectedAuthType() throws Exception
     {
         OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
-        JTextField templateVarsField = (JTextField) field(tab, "templateVarsField");
-        templateVarsField.setText("token=abc; env=prod; baseUrl=https://api.example");
-
         @SuppressWarnings("unchecked")
-        Map<String, String> vars = (Map<String, String>) invoke(
-                tab,
-                "templateVariablesSnapshot",
-                new Class<?>[]{String.class},
-                "(Operation default)"
-        );
-        assertEquals("abc", vars.get("token"));
-        assertEquals("prod", vars.get("env"));
-        assertEquals("https://api.example", vars.get("baseUrl"));
+        JComboBox<?> authSelector = (JComboBox<?>) field(tab, "authSelector");
+        JLabel authKeyLabel = (JLabel) field(tab, "authKeyLabel");
+        JTextField authKeyField = (JTextField) field(tab, "authKeyField");
+        JLabel authValueLabel = (JLabel) field(tab, "authValueLabel");
+        JTextField authValueField = (JTextField) field(tab, "authValueField");
 
-        int clampedMin = (Integer) invoke(tab, "parseBoundedInt", new Class<?>[]{String.class, int.class, int.class, int.class}, "-10", 4, 1, 10);
-        int clampedMax = (Integer) invoke(tab, "parseBoundedInt", new Class<?>[]{String.class, int.class, int.class, int.class}, "99", 4, 1, 10);
-        int fallback = (Integer) invoke(tab, "parseBoundedInt", new Class<?>[]{String.class, int.class, int.class, int.class}, "bad", 4, 1, 10);
-        assertEquals(1, clampedMin);
-        assertEquals(10, clampedMax);
-        assertEquals(4, fallback);
+        authSelector.setSelectedIndex(0);
+        assertFalse(authKeyField.isVisible());
+        assertFalse(authValueField.isVisible());
+
+        authSelector.setSelectedIndex(1);
+        assertFalse(authKeyField.isVisible());
+        assertTrue(authValueField.isVisible());
+        assertEquals("Token:", authValueLabel.getText());
+
+        authSelector.setSelectedIndex(2);
+        assertTrue(authKeyField.isVisible());
+        assertTrue(authValueField.isVisible());
+        assertEquals("Username:", authKeyLabel.getText());
+        assertEquals("Password:", authValueLabel.getText());
+
+        authSelector.setSelectedIndex(3);
+        assertEquals("Header name:", authKeyLabel.getText());
+
+        authSelector.setSelectedIndex(4);
+        assertEquals("Query name:", authKeyLabel.getText());
     }
 
     @Test
@@ -430,7 +478,7 @@ final class OpenApiSamplerTabTest
     }
 
     @Test
-    void urlListBatchParsingDeduplicatesAndCounts() throws Exception
+    void urlListParsingDeduplicatesAndCounts() throws Exception
     {
         OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
         @SuppressWarnings("unchecked")
@@ -453,6 +501,61 @@ final class OpenApiSamplerTabTest
         @SuppressWarnings("unchecked")
         List<String> skipNotes = (List<String>) recordValue(parsed, "skipNotes");
         assertEquals(3, skipNotes.size());
+    }
+
+    @Test
+    void urlListLoadPublishesParsedSpecsIncrementally() throws Exception
+    {
+        CountDownLatch secondFetchStarted = new CountDownLatch(1);
+        CountDownLatch releaseSecondFetch = new CountDownLatch(1);
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(
+                TestApiFactory.apiContext().api,
+                (url, responseTimeoutMs, perAttemptDeadlineMs, followRedirects) -> {
+                    if (url.contains("two.example"))
+                    {
+                        secondFetchStarted.countDown();
+                        assertTrue(releaseSecondFetch.await(2, TimeUnit.SECONDS));
+                        return fetchResponse(minimalJsonSpec("Two", "/two"));
+                    }
+                    return fetchResponse(minimalJsonSpec("One", "/one"));
+                }
+        );
+        OpenApiSamplerModel model = (OpenApiSamplerModel) field(tab, "model");
+        Path urlList = Files.createTempFile("openapi-url-list-", ".txt");
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try
+        {
+            Files.writeString(urlList, """
+                    https://one.example/openapi.json
+                    https://two.example/openapi.json
+                    """);
+
+            Future<Object> result = executor.submit(() -> {
+                try
+                {
+                    return invoke(tab, "fetchAndParseFromUrlList", new Class<?>[]{Path.class}, urlList);
+                }
+                catch (Exception ex)
+                {
+                    throw new RuntimeException(ex);
+                }
+            });
+
+            assertTrue(secondFetchStarted.await(2, TimeUnit.SECONDS));
+            assertTrue(waitUntil(() -> model.operations().size() == 1));
+            assertEquals("/one", model.operations().get(0).path());
+
+            releaseSecondFetch.countDown();
+            Object summary = result.get(2, TimeUnit.SECONDS);
+            assertEquals(2, recordValue(summary, "loadedSpecs"));
+            assertEquals(2, model.operations().size());
+        }
+        finally
+        {
+            releaseSecondFetch.countDown();
+            executor.shutdownNow();
+            Files.deleteIfExists(urlList);
+        }
     }
 
     @Test
@@ -543,6 +646,25 @@ final class OpenApiSamplerTabTest
 
         Repeater repeater = ctx.repeater;
         verify(repeater, times(2)).sendToRepeater(any(HttpRequest.class), contains("OpenAPI Sampler / All /"));
+    }
+
+    @Test
+    void selectedActionQueuesRequestToIntruder() throws Exception
+    {
+        TestApiFactory.ApiContext ctx = TestApiFactory.apiContext();
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(ctx.api);
+        OpenApiSamplerModel model = (OpenApiSamplerModel) field(tab, "model");
+        model.load(spec("https://intruder.example", "/users"), "https://intruder.example/openapi.json");
+
+        invoke(
+                tab,
+                "onSelectionAction",
+                new Class<?>[]{OpenApiSamplerTable.SelectionAction.class, List.class},
+                OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_INTRUDER,
+                List.of(model.operations().get(0))
+        );
+
+        verify(ctx.intruder, times(1)).sendToIntruder(any(HttpRequest.class));
     }
 
     @Test
@@ -762,11 +884,17 @@ final class OpenApiSamplerTabTest
     {
         OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
         ExecutorService workerPool = (ExecutorService) field(tab, "workerPool");
+        Audit activeAudit = mock(Audit.class);
+        Audit passiveAudit = mock(Audit.class);
+        setField(tab, "activeAuditTask", activeAudit);
+        setField(tab, "passiveAuditTask", passiveAudit);
 
         tab.dispose();
         tab.dispose();
 
         assertTrue(workerPool.isShutdown());
+        verify(activeAudit, times(1)).delete();
+        verify(passiveAudit, times(1)).delete();
     }
 
     @Test
@@ -783,27 +911,62 @@ final class OpenApiSamplerTabTest
     {
         OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
 
+        Path sample30 = Files.createTempFile("openapi-3.0-local-", ".json");
         Path sample31 = Path.of("samples/openapi-3.1-discriminator.yaml");
         Path sample20 = Path.of("samples/openapi-2.0-basic.yaml");
-        assertTrue(Files.exists(sample31));
-        assertTrue(Files.exists(sample20));
+        try
+        {
+            Files.writeString(sample30, """
+                    {
+                      "openapi":"3.0.3",
+                      "info":{"title":"Local JSON 3.0","version":"1.0"},
+                      "paths":{
+                        "/local":{
+                          "get":{
+                            "responses":{"200":{"description":"ok"}}
+                          }
+                        }
+                      }
+                    }
+                    """);
+            assertTrue(Files.exists(sample31));
+            assertTrue(Files.exists(sample20));
 
-        String sample31Content = Files.readString(sample31);
-        String sample20Content = Files.readString(sample20);
+            Object outcome30 = invoke(
+                    tab,
+                    "parseSpec",
+                    new Class<?>[]{String.class, String.class, String.class, boolean.class},
+                    Files.readString(sample30),
+                    sample30.getFileName().toString(),
+                    sample30.toUri().toString(),
+                    true
+            );
+            OpenAPI openApi30 = (OpenAPI) recordValue(outcome30, "openAPI");
+            assertEquals("3.0.3", openApi30.getOpenapi());
+            assertEquals("Local JSON 3.0", openApi30.getInfo().getTitle());
 
-        Object outcome31 = invoke(
-                tab,
-                "parseSpec",
-                new Class<?>[]{String.class, String.class, String.class, boolean.class},
-                sample31Content,
-                sample31.getFileName().toString(),
-                sample31.toUri().toString(),
-                true
-        );
-        OpenAPI openApi31 = (OpenAPI) recordValue(outcome31, "openAPI");
-        assertEquals("OpenAPI Sampler Demo 3.1", openApi31.getInfo().getTitle());
-        assertTrue(sample20Content.contains("swagger: '2.0'"));
-        assertTrue(Utils.looksLikeOpenApiSpec(sample20Content));
+            String sample31Content = Files.readString(sample31);
+            String sample20Content = Files.readString(sample20);
+
+            Object outcome31 = invoke(
+                    tab,
+                    "parseSpec",
+                    new Class<?>[]{String.class, String.class, String.class, boolean.class},
+                    sample31Content,
+                    sample31.getFileName().toString(),
+                    sample31.toUri().toString(),
+                    true
+            );
+            OpenAPI openApi31 = (OpenAPI) recordValue(outcome31, "openAPI");
+            assertEquals("3.1.0", openApi31.getOpenapi());
+            assertEquals("OpenAPI Sampler Demo 3.1", openApi31.getInfo().getTitle());
+            assertTrue(sample20Content.contains("swagger: '2.0'"));
+            assertTrue(Utils.looksLikeOpenApiSpec(sample20Content));
+        }
+        finally
+        {
+            Files.deleteIfExists(sample30);
+        }
     }
 
     @Test
@@ -827,6 +990,13 @@ final class OpenApiSamplerTabTest
         Field field = target.getClass().getDeclaredField(fieldName);
         field.setAccessible(true);
         return field.get(target);
+    }
+
+    private void setField(Object target, String fieldName, Object value) throws Exception
+    {
+        Field field = target.getClass().getDeclaredField(fieldName);
+        field.setAccessible(true);
+        field.set(target, value);
     }
 
     private Object invoke(Object target, String methodName, Class<?>[] types, Object... args) throws Exception
@@ -869,6 +1039,43 @@ final class OpenApiSamplerTabTest
             Thread.sleep(20L);
         }
         return predicate.test(labelHolder.text());
+    }
+
+    private boolean waitUntil(java.util.function.BooleanSupplier condition) throws Exception
+    {
+        long deadline = System.currentTimeMillis() + 2_000L;
+        while (System.currentTimeMillis() < deadline)
+        {
+            if (condition.getAsBoolean())
+            {
+                return true;
+            }
+            Thread.sleep(20L);
+        }
+        return condition.getAsBoolean();
+    }
+
+    private OpenApiSamplerTab.FetchResponse fetchResponse(String body)
+    {
+        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+        return new OpenApiSamplerTab.FetchResponse((short) 200, bytes, "application/json", bytes.length);
+    }
+
+    private String minimalJsonSpec(String title, String path)
+    {
+        return """
+                {
+                  "openapi":"3.0.3",
+                  "info":{"title":"%s","version":"1.0"},
+                  "paths":{
+                    "%s":{
+                      "get":{
+                        "responses":{"200":{"description":"ok"}}
+                      }
+                    }
+                  }
+                }
+                """.formatted(title, path);
     }
 
     private static final class JLabelHolder

@@ -1,16 +1,17 @@
 name: OpenAPI Sampler
-version: 2.1.0
+version: 2.2.0
 author: MelForze
 repo_url: https://github.com/MelForze/OpenAPI-Sampler
 extension_type: java
 entry_point: burp.openapi.OpenApiSamplerExtension
-minimum_burp_version: 2025.1
+minimum_burp_version: 2026.2
 minimum_java_version: 17
 short_description: OpenAPI sampler for Burp with OpenAPI 3.1 support, discriminator-aware examples, and export/replay workflows.
 long_description: |
   OpenAPI Sampler loads OpenAPI 2.0/3.0/3.1 specifications from local files, remote URLs,
   URL-list files, and Burp Target context menu captures. It generates schema-aware sample
-  requests (including discriminator-aware payloads), supports auth profiles and template
-  variables, provides replay/export workflows (RAW HTTP, cURL, Python requests), includes
-  batch execution controls (RPS/parallel/retries), and validates live responses against
-  OpenAPI response schemas. Built against Montoya API 2026.2.
+  requests (including discriminator-aware payloads), previews expected responses from
+  OpenAPI examples or schemas, supports auth profiles, and provides replay/export workflows
+  (RAW HTTP, cURL, Python requests).
+  URL-list loading adds parsed operations incrementally as each specification is fetched.
+  Built against Montoya API 2026.2.

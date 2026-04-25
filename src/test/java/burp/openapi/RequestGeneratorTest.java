@@ -1,6 +1,7 @@
 package burp.openapi;
 
 import burp.api.montoya.http.message.requests.HttpRequest;
+import burp.api.montoya.http.message.responses.HttpResponse;
 import io.swagger.v3.oas.models.Operation;
 import io.swagger.v3.oas.models.examples.Example;
 import io.swagger.v3.oas.models.media.ArraySchema;
@@ -14,6 +15,8 @@ import io.swagger.v3.oas.models.media.Schema;
 import io.swagger.v3.oas.models.media.StringSchema;
 import io.swagger.v3.oas.models.parameters.Parameter;
 import io.swagger.v3.oas.models.parameters.RequestBody;
+import io.swagger.v3.oas.models.responses.ApiResponse;
+import io.swagger.v3.oas.models.responses.ApiResponses;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -484,39 +487,31 @@ final class RequestGeneratorTest
     }
 
     @Test
-    void authProfileAndTemplateVariablesAreAppliedToRequest()
+    void bearerAuthProfileIsAppliedToRequest()
     {
         RequestGenerator generator = new RequestGenerator();
         List<Parameter> parameters = List.of(
-                new Parameter().in("path").name("tenant").example("{{tenant}}"),
-                new Parameter().in("query").name("trace").example("{{trace}}"),
-                new Parameter().in("header").name("X-Env").example("{{env}}")
+                new Parameter().in("path").name("tenant").example("acme"),
+                new Parameter().in("query").name("trace").example("trace-1"),
+                new Parameter().in("header").name("X-Env").example("prod")
         );
 
         OpenApiSamplerModel.OperationContext context = context(
                 "GET",
-                "/{{region}}/accounts/{tenant}",
-                List.of("https://{{baseHost}}"),
+                "/accounts/{tenant}",
+                List.of("https://api.example"),
                 parameters,
                 null,
                 new Operation()
         );
 
         RequestGenerator.GenerationOptions options = new RequestGenerator.GenerationOptions(
-                new RequestGenerator.AuthProfile(RequestGenerator.AuthType.BEARER, "", "{{token}}"),
-                Map.of(
-                        "baseHost", "api.example",
-                        "region", "eu",
-                        "tenant", "acme",
-                        "trace", "trace-1",
-                        "env", "prod",
-                        "token", "token-123"
-                )
+                new RequestGenerator.AuthProfile(RequestGenerator.AuthType.BEARER, "", "token-123")
         );
 
         HttpRequest request = generator.generate(context, DEFAULT_SERVER, List.of(), options);
         String raw = request.toString();
-        assertTrue(request.url().startsWith("https://api.example/eu/accounts/acme"));
+        assertTrue(request.url().startsWith("https://api.example/accounts/acme"));
         assertTrue(request.url().contains("trace=trace-1"));
         assertTrue(raw.contains("X-Env: prod"));
         assertTrue(raw.contains("Authorization: Bearer token-123"));
@@ -536,16 +531,14 @@ final class RequestGeneratorTest
         );
 
         RequestGenerator.GenerationOptions basicOptions = new RequestGenerator.GenerationOptions(
-                new RequestGenerator.AuthProfile(RequestGenerator.AuthType.BASIC, "alice", "wonderland"),
-                Map.of()
+                new RequestGenerator.AuthProfile(RequestGenerator.AuthType.BASIC, "alice", "wonderland")
         );
         HttpRequest basicRequest = generator.generate(context, DEFAULT_SERVER, List.of(), basicOptions);
         String encoded = Base64.getEncoder().encodeToString("alice:wonderland".getBytes());
         assertTrue(basicRequest.toString().contains("Authorization: Basic " + encoded));
 
         RequestGenerator.GenerationOptions queryOptions = new RequestGenerator.GenerationOptions(
-                new RequestGenerator.AuthProfile(RequestGenerator.AuthType.API_KEY_QUERY, "api_key", "q-1"),
-                Map.of()
+                new RequestGenerator.AuthProfile(RequestGenerator.AuthType.API_KEY_QUERY, "api_key", "q-1")
         );
         HttpRequest queryRequest = generator.generate(context, DEFAULT_SERVER, List.of(), queryOptions);
         assertTrue(queryRequest.url().contains("api_key=q-1"));
@@ -582,6 +575,39 @@ final class RequestGeneratorTest
         assertTrue(body.contains("12345"));
         assertTrue(body.contains("\"age\""));
         assertTrue(body.contains("18"));
+    }
+
+    @Test
+    void responsePreviewUsesOpenApiResponseSchema()
+    {
+        RequestGenerator generator = new RequestGenerator();
+
+        ObjectSchema responseSchema = new ObjectSchema();
+        responseSchema.addProperty("status", new StringSchema().example("ok"));
+        responseSchema.addProperty("id", new IntegerSchema().example(7));
+
+        Operation operation = new Operation().responses(new ApiResponses()
+                .addApiResponse("201", new ApiResponse()
+                        .description("Created")
+                        .content(new Content().addMediaType(
+                                "application/json",
+                                new MediaType().schema(responseSchema)
+                        ))));
+
+        OpenApiSamplerModel.OperationContext context = context(
+                "POST",
+                "/items",
+                List.of("https://api.example"),
+                List.of(),
+                null,
+                operation
+        );
+
+        HttpResponse response = generator.generateResponsePreview(context);
+        assertEquals(201, response.statusCode());
+        assertTrue(response.toString().contains("Content-Type: application/json"));
+        assertTrue(response.bodyToString().contains("\"status\""));
+        assertTrue(response.bodyToString().contains("\"id\""));
     }
 
     private OpenApiSamplerModel.OperationContext context(

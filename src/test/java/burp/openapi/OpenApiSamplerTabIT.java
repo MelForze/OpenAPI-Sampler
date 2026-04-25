@@ -93,6 +93,38 @@ final class OpenApiSamplerTabIT
     }
 
     @Test
+    void fetchesRemoteYamlOpenApi31Spec() throws Exception
+    {
+        try (MockWebServer server = new MockWebServer())
+        {
+            server.enqueue(new MockResponse()
+                    .setResponseCode(200)
+                    .addHeader("Content-Type", "application/yaml")
+                    .setBody("""
+                            openapi: 3.1.0
+                            info:
+                              title: Remote YAML 3.1
+                              version: "1.0"
+                            paths:
+                              /pets:
+                                get:
+                                  responses:
+                                    "200":
+                                      description: ok
+                            """));
+            server.start();
+
+            OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api, testHttpFetcher());
+            Object parseOutcome = invoke(tab, "fetchAndParseFromUrl", new Class<?>[]{String.class}, server.url("/openapi.yaml").toString());
+            OpenAPI openAPI = (OpenAPI) recordValue(parseOutcome, "openAPI");
+
+            assertNotNull(openAPI);
+            assertEquals("3.1.0", openAPI.getOpenapi());
+            assertEquals("Remote YAML 3.1", openAPI.getInfo().getTitle());
+        }
+    }
+
+    @Test
     void rejectsOversizedSpecBeforeParsing() throws Exception
     {
         try (MockWebServer server = new MockWebServer())

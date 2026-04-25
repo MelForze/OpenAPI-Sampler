@@ -5,14 +5,14 @@ This document tracks the repository assets and metadata prepared for BApp Store 
 ## Extension Identity
 
 - Name: `OpenAPI Sampler`
-- Version: `2.1.0`
+- Version: `2.2.0`
 - Author: `MelForze`
 - Type: `Java (Montoya API)`
 - Entry point: `burp.openapi.OpenApiSamplerExtension`
 
 ## Compatibility
 
-- Minimum Burp version: `2025.1`
+- Minimum Burp version: `2026.2`
 - Minimum Java version: `17`
 - Montoya API baseline: `2026.2`
 
@@ -20,9 +20,10 @@ This document tracks the repository assets and metadata prepared for BApp Store 
 
 - Supports OpenAPI `2.0`, `3.0.x`, and `3.1`
 - Discriminator-aware example generation for composed schemas
-- Auth profiles + template variables for repeatable request generation
-- Batch runner with configurable rate/parallelism/retries
-- Response validation against OpenAPI response schemas
+- Auth profiles for repeatable request generation
+- Request and expected response previews generated from OpenAPI examples/schemas
+- Bulk selected-operation server override for retargeting generated requests
+- Incremental URL-list loading: parsed operations appear as each spec is fetched
 - Export and replay workflows (RAW HTTP / cURL / Python requests)
 
 ## Repository Files Used for Submission
@@ -42,8 +43,8 @@ Place screenshots in `docs/screenshots/` with these names:
    Main tab loaded with parsed operations list.
 2. `02-request-preview-and-actions.png`  
    Row selection, request preview, and context menu actions.
-3. `03-batch-and-validation.png`  
-   Batch runner/auth settings and validation workflow.
+3. `03-url-list-loading.png`  
+   URL-list loading in progress with operations already appearing in the table.
 
 Recommended capture settings:
 
@@ -64,4 +65,4 @@ mvn -q -DskipTests package
 
 Produced artifact:
 
-- `target/openapi-sampler.jar`
+- `target/openapi-sampler-2.2.0.jar`

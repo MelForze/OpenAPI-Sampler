@@ -2,10 +2,12 @@ package burp.openapi;
 
 import burp.api.montoya.core.Range;
 import burp.api.montoya.http.HttpService;
+import burp.api.montoya.http.RequestOptions;
 import burp.api.montoya.http.message.HttpHeader;
 import burp.api.montoya.http.message.params.HttpParameterType;
 import burp.api.montoya.http.message.params.ParsedHttpParameter;
 import burp.api.montoya.http.message.requests.HttpRequest;
+import burp.api.montoya.http.message.responses.HttpResponse;
 import burp.api.montoya.internal.MontoyaObjectFactory;
 import burp.api.montoya.internal.ObjectFactoryLocator;
 import org.mockito.Mockito;
@@ -47,8 +49,13 @@ final class MontoyaFactoryBootstrap
                 HttpRequestProxy.fromUrl(invocation.getArgument(0)));
         when(factory.httpRequest(anyString())).thenAnswer(invocation ->
                 HttpRequestProxy.fromRaw(invocation.getArgument(0)));
+        when(factory.httpResponse()).thenAnswer(invocation ->
+                HttpResponseProxy.fromRaw("HTTP/1.1 200 OK\r\n\r\n"));
+        when(factory.httpResponse(anyString())).thenAnswer(invocation ->
+                HttpResponseProxy.fromRaw(invocation.getArgument(0)));
         when(factory.range(anyInt(), anyInt())).thenAnswer(invocation ->
                 rangeProxy(invocation.getArgument(0), invocation.getArgument(1)));
+        when(factory.requestOptions()).thenAnswer(invocation -> requestOptionsProxy());
 
         ObjectFactoryLocator.FACTORY = factory;
         installed = true;
@@ -85,6 +92,24 @@ final class MontoyaFactoryBootstrap
         return (Range) Proxy.newProxyInstance(
                 Range.class.getClassLoader(),
                 new Class[]{Range.class},
+                handler
+        );
+    }
+
+    private static RequestOptions requestOptionsProxy()
+    {
+        InvocationHandler handler = (proxy, method, args) -> switch (method.getName())
+        {
+            case "withHttpMode", "withConnectionId", "withUpstreamTLSVerification",
+                 "withRedirectionMode", "withServerNameIndicator", "withResponseTimeout" -> proxy;
+            case "toString" -> "RequestOptions[test]";
+            case "hashCode" -> System.identityHashCode(proxy);
+            case "equals" -> proxy == args[0];
+            default -> defaultValue(method.getReturnType());
+        };
+        return (RequestOptions) Proxy.newProxyInstance(
+                RequestOptions.class.getClassLoader(),
+                new Class[]{RequestOptions.class},
                 handler
         );
     }
@@ -546,6 +571,211 @@ final class MontoyaFactoryBootstrap
         }
 
         private record HeaderValue(String name, String value)
+        {
+            HttpHeader toHeader()
+            {
+                InvocationHandler handler = (proxy, method, args) -> switch (method.getName())
+                {
+                    case "name" -> name;
+                    case "value" -> value;
+                    case "toString" -> name + ": " + value;
+                    case "hashCode" -> Objects.hash(name.toLowerCase(Locale.ROOT), value);
+                    case "equals" -> {
+                        if (proxy == args[0])
+                        {
+                            yield true;
+                        }
+                        if (!(args[0] instanceof HttpHeader header))
+                        {
+                            yield false;
+                        }
+                        yield name.equalsIgnoreCase(header.name()) && Objects.equals(value, header.value());
+                    }
+                    default -> defaultValue(method.getReturnType());
+                };
+                return (HttpHeader) Proxy.newProxyInstance(
+                        HttpHeader.class.getClassLoader(),
+                        new Class[]{HttpHeader.class},
+                        handler
+                );
+            }
+        }
+    }
+
+    private static final class HttpResponseProxy implements InvocationHandler
+    {
+        private final String httpVersion;
+        private final short statusCode;
+        private final String reasonPhrase;
+        private final List<ResponseHeaderValue> headers;
+        private final String body;
+
+        private HttpResponseProxy(
+                String httpVersion,
+                short statusCode,
+                String reasonPhrase,
+                List<ResponseHeaderValue> headers,
+                String body)
+        {
+            this.httpVersion = Utils.coalesce(httpVersion, "HTTP/1.1");
+            this.statusCode = statusCode;
+            this.reasonPhrase = Utils.coalesce(reasonPhrase, "OK");
+            this.headers = new ArrayList<>(headers);
+            this.body = body == null ? "" : body;
+        }
+
+        static HttpResponse fromRaw(String raw)
+        {
+            String safeRaw = raw == null ? "HTTP/1.1 200 OK\r\n\r\n" : raw;
+            String[] sections = safeRaw.split("\\r?\\n\\r?\\n", 2);
+            String head = sections.length > 0 ? sections[0] : "";
+            String body = sections.length > 1 ? sections[1] : "";
+            String[] lines = head.split("\\r?\\n");
+
+            String httpVersion = "HTTP/1.1";
+            short statusCode = 200;
+            String reasonPhrase = "OK";
+            if (lines.length > 0)
+            {
+                String[] first = lines[0].split(" ", 3);
+                if (first.length >= 1 && Utils.nonBlank(first[0]))
+                {
+                    httpVersion = first[0];
+                }
+                if (first.length >= 2)
+                {
+                    try
+                    {
+                        statusCode = Short.parseShort(first[1]);
+                    }
+                    catch (NumberFormatException ignored)
+                    {
+                        statusCode = 200;
+                    }
+                }
+                if (first.length >= 3)
+                {
+                    reasonPhrase = first[2];
+                }
+            }
+
+            List<ResponseHeaderValue> headers = new ArrayList<>();
+            for (int i = 1; i < lines.length; i++)
+            {
+                int colon = lines[i].indexOf(':');
+                if (colon > 0)
+                {
+                    headers.add(new ResponseHeaderValue(lines[i].substring(0, colon).trim(), lines[i].substring(colon + 1).trim()));
+                }
+            }
+
+            return proxy(new HttpResponseProxy(httpVersion, statusCode, reasonPhrase, headers, body));
+        }
+
+        private static HttpResponse proxy(HttpResponseProxy state)
+        {
+            return (HttpResponse) Proxy.newProxyInstance(
+                    HttpResponse.class.getClassLoader(),
+                    new Class[]{HttpResponse.class},
+                    state
+            );
+        }
+
+        @Override
+        public Object invoke(Object proxy, Method method, Object[] args)
+        {
+            return switch (method.getName())
+            {
+                case "statusCode" -> statusCode;
+                case "reasonPhrase" -> reasonPhrase;
+                case "httpVersion" -> httpVersion;
+                case "bodyToString" -> body;
+                case "headers" -> headers.stream().map(ResponseHeaderValue::toHeader).toList();
+                case "headerValue" -> headerValue(String.valueOf(args[0]));
+                case "header" -> header(String.valueOf(args[0]));
+                case "hasHeader" -> hasHeader(args);
+                case "toString" -> rawResponse();
+                case "withStatusCode" -> proxy(new HttpResponseProxy(httpVersion, (Short) args[0], reasonPhrase, headers, body));
+                case "withReasonPhrase" -> proxy(new HttpResponseProxy(httpVersion, statusCode, String.valueOf(args[0]), headers, body));
+                case "withHttpVersion" -> proxy(new HttpResponseProxy(String.valueOf(args[0]), statusCode, reasonPhrase, headers, body));
+                case "withBody" -> proxy(new HttpResponseProxy(httpVersion, statusCode, reasonPhrase, headers, String.valueOf(args[0])));
+                case "withAddedHeader", "withUpdatedHeader" -> proxy(withHeader(args));
+                case "hashCode" -> Objects.hash(httpVersion, statusCode, reasonPhrase, headers, body);
+                case "equals" -> proxy == args[0];
+                default -> defaultValue(method.getReturnType());
+            };
+        }
+
+        private HttpResponseProxy withHeader(Object[] args)
+        {
+            List<ResponseHeaderValue> next = new ArrayList<>(headers);
+            if (args != null && args.length == 2)
+            {
+                String name = String.valueOf(args[0]);
+                next.removeIf(header -> header.name.equalsIgnoreCase(name));
+                next.add(new ResponseHeaderValue(name, String.valueOf(args[1])));
+            }
+            return new HttpResponseProxy(httpVersion, statusCode, reasonPhrase, next, body);
+        }
+
+        private boolean hasHeader(Object[] args)
+        {
+            if (args == null || args.length == 0)
+            {
+                return false;
+            }
+            if (args.length == 1 && args[0] instanceof String name)
+            {
+                return header(name) != null;
+            }
+            if (args.length == 2 && args[0] instanceof String name && args[1] instanceof String value)
+            {
+                return headers.stream().anyMatch(header -> header.name.equalsIgnoreCase(name) && Objects.equals(header.value, value));
+            }
+            if (args.length == 1 && args[0] instanceof HttpHeader header)
+            {
+                return headers.stream().anyMatch(h -> h.name.equalsIgnoreCase(header.name()) && Objects.equals(h.value, header.value()));
+            }
+            return false;
+        }
+
+        private String headerValue(String name)
+        {
+            ResponseHeaderValue header = headerValueRecord(name);
+            return header == null ? null : header.value;
+        }
+
+        private HttpHeader header(String name)
+        {
+            ResponseHeaderValue header = headerValueRecord(name);
+            return header == null ? null : header.toHeader();
+        }
+
+        private ResponseHeaderValue headerValueRecord(String name)
+        {
+            for (ResponseHeaderValue header : headers)
+            {
+                if (header.name.equalsIgnoreCase(name))
+                {
+                    return header;
+                }
+            }
+            return null;
+        }
+
+        private String rawResponse()
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.append(httpVersion).append(' ').append(statusCode).append(' ').append(reasonPhrase).append("\r\n");
+            for (ResponseHeaderValue header : headers)
+            {
+                sb.append(header.name).append(": ").append(header.value).append("\r\n");
+            }
+            sb.append("\r\n").append(body);
+            return sb.toString();
+        }
+
+        private record ResponseHeaderValue(String name, String value)
         {
             HttpHeader toHeader()
             {

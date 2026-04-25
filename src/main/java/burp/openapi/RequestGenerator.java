@@ -1,6 +1,7 @@
 package burp.openapi;
 
 import burp.api.montoya.http.message.requests.HttpRequest;
+import burp.api.montoya.http.message.responses.HttpResponse;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.swagger.v3.oas.models.Operation;
@@ -13,6 +14,8 @@ import io.swagger.v3.oas.models.media.MediaType;
 import io.swagger.v3.oas.models.media.Schema;
 import io.swagger.v3.oas.models.parameters.Parameter;
 import io.swagger.v3.oas.models.parameters.RequestBody;
+import io.swagger.v3.oas.models.responses.ApiResponse;
+import io.swagger.v3.oas.models.responses.ApiResponses;
 
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
@@ -28,8 +31,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 /**
  * Converts OpenAPI operations into concrete Burp HttpRequest objects with generated examples.
@@ -38,7 +39,6 @@ public final class RequestGenerator
 {
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     private static final int MAX_ARRAY_EXAMPLES = 3;
-    private static final Pattern TEMPLATE_PATTERN = Pattern.compile("\\{\\{\\s*([A-Za-z0-9_.-]+)\\s*}}");
 
     public enum AuthType
     {
@@ -65,33 +65,16 @@ public final class RequestGenerator
         }
     }
 
-    public record GenerationOptions(AuthProfile authProfile, Map<String, String> templateVariables)
+    public record GenerationOptions(AuthProfile authProfile)
     {
         public static GenerationOptions defaults()
         {
-            return new GenerationOptions(AuthProfile.none(), Map.of());
+            return new GenerationOptions(AuthProfile.none());
         }
 
         public GenerationOptions
         {
             authProfile = authProfile == null ? AuthProfile.none() : authProfile;
-            if (templateVariables == null || templateVariables.isEmpty())
-            {
-                templateVariables = Map.of();
-            }
-            else
-            {
-                Map<String, String> normalized = new LinkedHashMap<>();
-                for (Map.Entry<String, String> entry : templateVariables.entrySet())
-                {
-                    if (entry == null || Utils.isBlank(entry.getKey()))
-                    {
-                        continue;
-                    }
-                    normalized.put(entry.getKey().trim(), Utils.coalesce(entry.getValue()));
-                }
-                templateVariables = Map.copyOf(normalized);
-            }
         }
     }
 
@@ -117,8 +100,6 @@ public final class RequestGenerator
         {
             server = "http://localhost";
         }
-        server = applyTemplate(server, resolvedOptions.templateVariables());
-
         final Map<String, String> pathParams = new LinkedHashMap<>();
         final Map<String, String> queryParams = new LinkedHashMap<>();
         final Map<String, String> headerParams = new LinkedHashMap<>();
@@ -134,7 +115,6 @@ public final class RequestGenerator
 
             String in = Utils.coalesce(parameter.getIn(), "query").toLowerCase(Locale.ROOT);
             String value = parameterExampleValue(parameter);
-            value = applyTemplate(value, resolvedOptions.templateVariables());
 
             switch (in)
             {
@@ -149,32 +129,30 @@ public final class RequestGenerator
             }
         }
 
-        applyAuthToParams(resolvedOptions.authProfile(), queryParams, headerParams, resolvedOptions.templateVariables());
+        applyAuthToParams(resolvedOptions.authProfile(), queryParams, headerParams);
 
         String resolvedPath = fillPathParams(
-                applyTemplate(operationContext.path(), resolvedOptions.templateVariables()),
+                operationContext.path(),
                 pathParams
         );
 
         String queryString = toQueryString(queryParams);
-        String finalUrl = applyTemplate(joinUrl(server, resolvedPath, queryString), resolvedOptions.templateVariables());
+        String finalUrl = joinUrl(server, resolvedPath, queryString);
 
         BodyPayload bodyPayload = generateBody(operationContext.operation(), operationContext.requestBody(), legacyFormParams);
-        String body = applyTemplate(bodyPayload.body(), resolvedOptions.templateVariables());
-        String contentType = applyTemplate(bodyPayload.contentType(), resolvedOptions.templateVariables());
+        String body = bodyPayload.body();
+        String contentType = bodyPayload.contentType();
 
         HttpRequest request = HttpRequest.httpRequestFromUrl(finalUrl).withMethod(operationContext.method());
 
         for (Map.Entry<String, String> headerEntry : headerParams.entrySet())
         {
-            String headerName = applyTemplate(headerEntry.getKey(), resolvedOptions.templateVariables());
-            String headerValue = applyTemplate(headerEntry.getValue(), resolvedOptions.templateVariables());
-            request = request.withAddedHeader(headerName, headerValue);
+            request = request.withAddedHeader(headerEntry.getKey(), headerEntry.getValue());
         }
 
         if (!cookieParams.isEmpty())
         {
-            request = request.withAddedHeader("Cookie", applyTemplate(cookieHeader(cookieParams), resolvedOptions.templateVariables()));
+            request = request.withAddedHeader("Cookie", cookieHeader(cookieParams));
         }
 
         if (Utils.nonBlank(contentType))
@@ -190,19 +168,63 @@ public final class RequestGenerator
         return request;
     }
 
+    public HttpResponse generateResponsePreview(OpenApiSamplerModel.OperationContext operationContext)
+    {
+        Objects.requireNonNull(operationContext, "operationContext must not be null");
+
+        ResponseSelection responseSelection = selectResponse(operationContext.operation());
+        if (responseSelection == null)
+        {
+            return HttpResponse.httpResponse("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nNo response schema or example is defined for this operation.");
+        }
+
+        short statusCode = responseSelection.statusCode();
+        String reason = reasonPhrase(statusCode);
+        String contentType = "text/plain";
+        String body = Utils.coalesce(responseSelection.response().getDescription(), "No response body is defined.");
+
+        Content content = responseSelection.response().getContent();
+        MediaSelection mediaSelection = selectMediaType(content);
+        if (mediaSelection != null)
+        {
+            contentType = mediaSelection.contentType();
+            MediaType media = mediaSelection.mediaType();
+            Object payload = extractMediaTypeExample(media);
+            if (payload == null && media.getSchema() != null)
+            {
+                payload = buildExampleFromSchema(media.getSchema(), new LinkedHashSet<>());
+            }
+
+            if (payload != null)
+            {
+                body = responseBodyForContentType(contentType, payload);
+            }
+        }
+
+        if (statusCode == 204 || statusCode == 304)
+        {
+            return HttpResponse.httpResponse("HTTP/1.1 " + statusCode + " " + reason + "\r\n\r\n");
+        }
+
+        return HttpResponse.httpResponse(
+                "HTTP/1.1 " + statusCode + " " + reason + "\r\n"
+                        + "Content-Type: " + contentType + "\r\n\r\n"
+                        + body
+        );
+    }
+
     private void applyAuthToParams(
             AuthProfile authProfile,
             Map<String, String> queryParams,
-            Map<String, String> headerParams,
-            Map<String, String> templateVariables)
+            Map<String, String> headerParams)
     {
         if (authProfile == null || authProfile.type() == null || authProfile.type() == AuthType.NONE)
         {
             return;
         }
 
-        String key = applyTemplate(authProfile.key(), templateVariables);
-        String value = applyTemplate(authProfile.value(), templateVariables);
+        String key = authProfile.key();
+        String value = authProfile.value();
         switch (authProfile.type())
         {
             case NONE -> {
@@ -464,6 +486,113 @@ public final class RequestGenerator
         }
 
         return null;
+    }
+
+    private ResponseSelection selectResponse(Operation operation)
+    {
+        ApiResponses responses = operation != null ? operation.getResponses() : null;
+        if (responses == null || responses.isEmpty())
+        {
+            return null;
+        }
+
+        for (String preferred : List.of("200", "201", "202", "204"))
+        {
+            ApiResponse response = responses.get(preferred);
+            if (response != null)
+            {
+                return new ResponseSelection((short) Integer.parseInt(preferred), response);
+            }
+        }
+
+        for (Map.Entry<String, ApiResponse> entry : responses.entrySet())
+        {
+            if (entry.getValue() == null)
+            {
+                continue;
+            }
+            short status = parseStatusCode(entry.getKey(), (short) 200);
+            if (status >= 200 && status < 300)
+            {
+                return new ResponseSelection(status, entry.getValue());
+            }
+        }
+
+        ApiResponse defaultResponse = responses.get("default");
+        if (defaultResponse != null)
+        {
+            return new ResponseSelection((short) 200, defaultResponse);
+        }
+
+        Map.Entry<String, ApiResponse> first = responses.entrySet().stream()
+                .filter(entry -> entry.getValue() != null)
+                .findFirst()
+                .orElse(null);
+        if (first == null)
+        {
+            return null;
+        }
+        return new ResponseSelection(parseStatusCode(first.getKey(), (short) 200), first.getValue());
+    }
+
+    private short parseStatusCode(String rawStatusCode, short fallback)
+    {
+        try
+        {
+            int parsed = Integer.parseInt(Utils.coalesce(rawStatusCode));
+            if (parsed >= 100 && parsed <= 599)
+            {
+                return (short) parsed;
+            }
+        }
+        catch (NumberFormatException ignored)
+        {
+            // Use fallback for OpenAPI "default" and malformed extension statuses.
+        }
+        return fallback;
+    }
+
+    private String reasonPhrase(short statusCode)
+    {
+        return switch (statusCode)
+        {
+            case 200 -> "OK";
+            case 201 -> "Created";
+            case 202 -> "Accepted";
+            case 204 -> "No Content";
+            case 301 -> "Moved Permanently";
+            case 302 -> "Found";
+            case 304 -> "Not Modified";
+            case 400 -> "Bad Request";
+            case 401 -> "Unauthorized";
+            case 403 -> "Forbidden";
+            case 404 -> "Not Found";
+            case 409 -> "Conflict";
+            case 422 -> "Unprocessable Content";
+            case 429 -> "Too Many Requests";
+            case 500 -> "Internal Server Error";
+            case 502 -> "Bad Gateway";
+            case 503 -> "Service Unavailable";
+            default -> statusCode >= 200 && statusCode < 300 ? "OK" : "Response";
+        };
+    }
+
+    private String responseBodyForContentType(String contentType, Object payload)
+    {
+        String lowerMediaType = Utils.safeLower(contentType);
+        if (lowerMediaType.contains("application/json") || lowerMediaType.endsWith("+json"))
+        {
+            return toJson(payload);
+        }
+        if (lowerMediaType.contains("application/x-www-form-urlencoded"))
+        {
+            return toFormUrlEncoded(payload);
+        }
+        if (lowerMediaType.contains("multipart/form-data"))
+        {
+            return toMultipart(payload, "----OpenApiSamplerResponseBoundary");
+        }
+        return normalizeExampleToString(payload);
     }
 
     private Object buildExampleFromSchema(Schema<?> schema, Set<String> visitedRefs)
@@ -807,30 +936,6 @@ public final class RequestGenerator
         return "sample-" + discriminator.getPropertyName();
     }
 
-    private String applyTemplate(String input, Map<String, String> variables)
-    {
-        String text = Utils.coalesce(input);
-        if (Utils.isBlank(text) || variables == null || variables.isEmpty())
-        {
-            return text;
-        }
-
-        Matcher matcher = TEMPLATE_PATTERN.matcher(text);
-        StringBuffer out = new StringBuffer();
-        while (matcher.find())
-        {
-            String key = matcher.group(1);
-            String replacement = Utils.coalesce(variables.get(key));
-            if (Utils.isBlank(replacement))
-            {
-                replacement = matcher.group(0);
-            }
-            matcher.appendReplacement(out, Matcher.quoteReplacement(replacement));
-        }
-        matcher.appendTail(out);
-        return out.toString();
-    }
-
     private String stringSample(Schema<?> schema)
     {
         String format = Utils.safeLower(Utils.coalesce(schema.getFormat()));
@@ -1026,6 +1131,10 @@ public final class RequestGenerator
     }
 
     private record MediaSelection(String contentType, MediaType mediaType)
+    {
+    }
+
+    private record ResponseSelection(short statusCode, ApiResponse response)
     {
     }
 }

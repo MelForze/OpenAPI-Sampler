@@ -88,6 +88,35 @@ public final class OpenApiSamplerModel
         return before - operations.size();
     }
 
+    public int replaceServer(Collection<OperationContext> selectedOperations, String server)
+    {
+        String normalizedServer = Utils.stripTrailingSlash(Utils.coalesce(server));
+        if (selectedOperations == null || selectedOperations.isEmpty() || Utils.isBlank(normalizedServer))
+        {
+            return 0;
+        }
+
+        Set<OperationContext> targets = new LinkedHashSet<>(selectedOperations);
+        int updated = 0;
+        for (int i = 0; i < operations.size(); i++)
+        {
+            OperationContext operation = operations.get(i);
+            if (operation == null || !targets.contains(operation))
+            {
+                continue;
+            }
+
+            operations.set(i, operation.withServer(normalizedServer));
+            updated++;
+        }
+
+        if (updated > 0)
+        {
+            recalculateIndexes();
+        }
+        return updated;
+    }
+
     public void clear()
     {
         openAPI = null;
@@ -697,6 +726,26 @@ public final class OpenApiSamplerModel
                 }
             }
             return "http://localhost";
+        }
+
+        public OperationContext withServer(String server)
+        {
+            String normalizedServer = Utils.stripTrailingSlash(Utils.coalesce(server));
+            List<String> replacementServers = Utils.nonBlank(normalizedServer) ? List.of(normalizedServer) : servers;
+            return new OperationContext(
+                    sourceId,
+                    sourceLabel,
+                    sourceLocation,
+                    method,
+                    path,
+                    summary,
+                    operationId,
+                    tags,
+                    replacementServers,
+                    parameters,
+                    requestBody,
+                    operation
+            );
         }
 
         public Schema<?> requestSchema()

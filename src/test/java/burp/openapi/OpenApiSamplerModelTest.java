@@ -410,6 +410,22 @@ final class OpenApiSamplerModelTest
         assertFalse(model.filter("", "https://another.example").size() > 0);
     }
 
+    @Test
+    void selectedOperationsCanReplaceServer()
+    {
+        OpenApiSamplerModel model = new OpenApiSamplerModel();
+        model.load(singleGetSpec("https://api.example", "/users", "users", "Users"), "https://api.example/openapi.json");
+        model.load(singleGetSpec("https://api.example", "/orders", "orders", "Orders"), "https://api.example/openapi.json");
+
+        int updated = model.replaceServer(model.operations(), "http://127.0.0.1:18080/");
+
+        assertEquals(2, updated);
+        assertEquals(List.of("http://127.0.0.1:18080"), model.availableServers());
+        assertEquals(2, model.filter("", "http://127.0.0.1:18080").size());
+        assertTrue(model.operations().stream()
+                .allMatch(operation -> operation.servers().equals(List.of("http://127.0.0.1:18080"))));
+    }
+
     private OpenAPI singleGetSpec(String server, String path, String operationId, String summary)
     {
         Operation operation = new Operation()

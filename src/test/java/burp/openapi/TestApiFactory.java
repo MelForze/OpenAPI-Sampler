@@ -16,6 +16,7 @@ import burp.api.montoya.sitemap.SiteMap;
 import burp.api.montoya.ui.UserInterface;
 import burp.api.montoya.ui.editor.EditorOptions;
 import burp.api.montoya.ui.editor.HttpRequestEditor;
+import burp.api.montoya.ui.editor.HttpResponseEditor;
 
 import javax.swing.JPanel;
 import java.util.Map;
@@ -39,6 +40,7 @@ final class TestApiFactory
         Extension extension = mock(Extension.class);
         UserInterface userInterface = mock(UserInterface.class);
         HttpRequestEditor requestEditor = mock(HttpRequestEditor.class);
+        HttpResponseEditor responseEditor = mock(HttpResponseEditor.class);
         Logging logging = mock(Logging.class);
         Repeater repeater = mock(Repeater.class);
         Intruder intruder = mock(Intruder.class);
@@ -67,10 +69,12 @@ final class TestApiFactory
         when(persistence.extensionData()).thenReturn(extensionData);
 
         when(userInterface.createHttpRequestEditor(any(EditorOptions[].class))).thenReturn(requestEditor);
+        when(userInterface.createHttpResponseEditor(any(EditorOptions[].class))).thenReturn(responseEditor);
         when(userInterface.registerSuiteTab(anyString(), any())).thenReturn(suiteTabRegistration);
         when(userInterface.registerContextMenuItemsProvider(any())).thenReturn(contextMenuRegistration);
         when(extension.registerUnloadingHandler(any(ExtensionUnloadingHandler.class))).thenReturn(unloadingRegistration);
         when(requestEditor.uiComponent()).thenReturn(new JPanel());
+        when(responseEditor.uiComponent()).thenReturn(new JPanel());
         when(suiteTabRegistration.isRegistered()).thenReturn(true);
         when(contextMenuRegistration.isRegistered()).thenReturn(true);
         when(unloadingRegistration.isRegistered()).thenReturn(true);
@@ -91,6 +95,7 @@ final class TestApiFactory
                 extension,
                 userInterface,
                 requestEditor,
+                responseEditor,
                 logging,
                 repeater,
                 intruder,
@@ -112,6 +117,7 @@ final class TestApiFactory
         final Extension extension;
         final UserInterface userInterface;
         final HttpRequestEditor requestEditor;
+        final HttpResponseEditor responseEditor;
         final Logging logging;
         final Repeater repeater;
         final Intruder intruder;
@@ -130,6 +136,7 @@ final class TestApiFactory
                 Extension extension,
                 UserInterface userInterface,
                 HttpRequestEditor requestEditor,
+                HttpResponseEditor responseEditor,
                 Logging logging,
                 Repeater repeater,
                 Intruder intruder,
@@ -147,6 +154,7 @@ final class TestApiFactory
             this.extension = extension;
             this.userInterface = userInterface;
             this.requestEditor = requestEditor;
+            this.responseEditor = responseEditor;
             this.logging = logging;
             this.repeater = repeater;
             this.intruder = intruder;

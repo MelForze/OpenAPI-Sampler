@@ -27,16 +27,12 @@ Compared to older OpenAPI parser extensions, this project focuses on:
   - Burp Target context menu (`Send to OpenAPI Sampler`)
   - Swagger UI pages (`/swagger/index.html`, `/swagger-ui/index.html`) with fallback discovery
 - Source-aware operation view with server and search filters.
-- Request preview pane and row-level context actions.
-- Auth profiles and template variables:
+- Request and expected response preview panes, generated from OpenAPI examples/schemas.
+- Row-level context actions, including bulk server override for selected operations.
+- Auth profiles for generated requests:
   - `Bearer`, `Basic`, `API key` (header/query), `OAuth2 Bearer`
-  - template placeholders like `{{token}}`, `{{baseUrl}}`
-- Batch runner for selected operations:
-  - configurable `RPS`, `parallelism`, `retries`
-  - summary by response class (`2xx/4xx/5xx/failed`)
-- Response schema validation:
-  - send selected operations and validate live responses against OpenAPI response schemas
 - URL-list loading quality-of-life:
+  - parsed operations are added to the table as each spec is fetched
   - retry with backoff on temporary failures
   - progress indicator and cancel button
   - failed-URL collection and copy helper
@@ -48,7 +44,7 @@ Compared to older OpenAPI parser extensions, this project focuses on:
 
 ## Requirements
 
-- Burp Suite: `2025.1+`
+- Burp Suite: `2026.2+`
 - Java: `17+`
 - Montoya API baseline: `2026.2` (build target)
 - Maven: `3.9+` (for local build)
@@ -60,16 +56,16 @@ mvn clean package
 ```
 
 Output JAR:
-- `target/openapi-sampler.jar`
+- `target/openapi-sampler-2.2.0.jar`
 
 ## Install in Burp
 
 1. Open `Burp -> Extender -> Extensions`.
 2. Click `Add`.
 3. Select extension type `Java`.
-4. Choose `target/openapi-sampler.jar`.
+4. Choose `target/openapi-sampler-2.2.0.jar`.
 5. Verify extension output includes:
-   - `[OpenAPI Sampler] Loaded. Version=2.1.0, Author=MelForze`
+   - `[OpenAPI Sampler] Loaded. Version=2.2.0, Author=MelForze`
 
 ## Offline / Online Usage
 
@@ -86,6 +82,11 @@ Output JAR:
 3. Pick source and server filters.
 4. Filter operations by method/path/tag/summary.
 5. Use context actions for replay/export operations.
+
+### Request Options
+
+- `Auth` is optional. `Bearer` and `OAuth2 Bearer` show only `Token`; the generated request uses `Authorization: Bearer <token>`.
+- `API Key (Header)` uses `Header name` + `Value`; `API Key (Query)` uses `Query name` + `Value`.
 
 ## URL List File Format
 
@@ -116,7 +117,7 @@ service-a,https://svc-a.example.com/v3/api-docs,team-red
 
 - Submission checklist and listing notes: `docs/BAPP_SUBMISSION.md`
 - Screenshot folder and naming convention: `docs/screenshots/README.md`
-- Current release artifact after build: `target/openapi-sampler.jar`
+- Current release artifact after build: `target/openapi-sampler-2.2.0.jar`
 
 ## License
 
