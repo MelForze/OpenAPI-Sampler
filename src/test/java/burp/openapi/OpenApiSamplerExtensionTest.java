@@ -13,6 +13,7 @@ import static org.mockito.ArgumentMatchers.contains;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.verify;
 
 final class OpenApiSamplerExtensionTest
@@ -31,11 +32,11 @@ final class OpenApiSamplerExtensionTest
 
         extension.initialize(ctx.api);
 
-        verify(ctx.extension).setName("OpenAPI Sampler v2.2.0");
+        verify(ctx.extension).setName("OpenAPI Sampler v2.2.1");
         verify(ctx.userInterface).registerSuiteTab(eq("OpenAPI Sampler"), any(Component.class));
         verify(ctx.userInterface).registerContextMenuItemsProvider(any(ContextMenuItemsProvider.class));
         verify(ctx.extension).registerUnloadingHandler(eq(extension));
-        verify(ctx.logging).logToOutput(contains("[OpenAPI Sampler] Loaded. Version=2.2.0, Author=MelForze"));
+        verify(ctx.logging).logToOutput(contains("[OpenAPI Sampler] Loaded. Version=2.2.1, Author=MelForze"));
     }
 
     @Test
@@ -51,6 +52,24 @@ final class OpenApiSamplerExtensionTest
         verify(ctx.suiteTabRegistration, times(1)).deregister();
         verify(ctx.contextMenuRegistration, times(1)).deregister();
         verify(ctx.unloadingRegistration, times(1)).deregister();
+    }
+
+    @Test
+    void unloadLogsDeregistrationFailuresAndContinuesCleanup()
+    {
+        TestApiFactory.ApiContext ctx = TestApiFactory.apiContext();
+        OpenApiSamplerExtension extension = new OpenApiSamplerExtension();
+        extension.initialize(ctx.api);
+        RuntimeException failure = new IllegalStateException("deregister failed");
+        doThrow(failure).when(ctx.contextMenuRegistration).deregister();
+
+        extension.extensionUnloaded();
+        extension.extensionUnloaded();
+
+        verify(ctx.logging).logToError(contains("Unable to deregister"), eq(failure));
+        verify(ctx.suiteTabRegistration).deregister();
+        verify(ctx.unloadingRegistration).deregister();
+        verify(ctx.contextMenuRegistration).deregister();
     }
 
     @Test

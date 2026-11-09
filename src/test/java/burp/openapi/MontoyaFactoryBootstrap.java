@@ -98,20 +98,7 @@ final class MontoyaFactoryBootstrap
 
     private static RequestOptions requestOptionsProxy()
     {
-        InvocationHandler handler = (proxy, method, args) -> switch (method.getName())
-        {
-            case "withHttpMode", "withConnectionId", "withUpstreamTLSVerification",
-                 "withRedirectionMode", "withServerNameIndicator", "withResponseTimeout" -> proxy;
-            case "toString" -> "RequestOptions[test]";
-            case "hashCode" -> System.identityHashCode(proxy);
-            case "equals" -> proxy == args[0];
-            default -> defaultValue(method.getReturnType());
-        };
-        return (RequestOptions) Proxy.newProxyInstance(
-                RequestOptions.class.getClassLoader(),
-                new Class[]{RequestOptions.class},
-                handler
-        );
+        return Mockito.mock(RequestOptions.class, Mockito.RETURNS_SELF);
     }
 
     private static Object defaultValue(Class<?> type)

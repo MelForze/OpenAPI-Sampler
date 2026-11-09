@@ -30,18 +30,18 @@ mvn clean package
 The JAR is created at:
 
 ```text
-target/openapi-sampler-2.2.0.jar
+target/openapi-sampler-2.2.1.jar
 ```
 
 ## Install
 
 1. Open `Extensions > Installed > Add` in Burp.
 2. Select extension type `Java`.
-3. Choose `target/openapi-sampler-2.2.0.jar`.
+3. Choose `target/openapi-sampler-2.2.1.jar`.
 4. Check the extension output for:
 
 ```text
-[OpenAPI Sampler] Loaded. Version=2.2.0, Author=MelForze
+[OpenAPI Sampler] Loaded. Version=2.2.1, Author=MelForze
 ```
 
 ## Usage
@@ -51,6 +51,10 @@ target/openapi-sampler-2.2.0.jar
 3. Select source/server filters if needed.
 4. Select operations in the table.
 5. Use right-click actions to send, export, delete, or change server for selected operations.
+
+URL fetches verify upstream TLS certificates. Specification bodies and local spec files are limited to 5 MiB.
+The Target context menu checks JSON/YAML Content-Types (including `+json`/`+yaml`) and inspects at most
+16 KiB of the response before offering the action; full decoding and parsing run in the background after selection.
 
 ## Auth
 

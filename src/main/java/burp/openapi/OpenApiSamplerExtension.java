@@ -13,7 +13,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class OpenApiSamplerExtension implements BurpExtension, ExtensionUnloadingHandler
 {
     public static final String NAME = "OpenAPI Sampler";
-    public static final String VERSION = "2.2.0";
+    public static final String VERSION = "2.2.1";
     public static final String AUTHOR = "MelForze";
 
     private final AtomicBoolean unloaded = new AtomicBoolean(false);
@@ -61,9 +61,9 @@ public final class OpenApiSamplerExtension implements BurpExtension, ExtensionUn
             {
                 tab.dispose();
             }
-            catch (Exception ignored)
+            catch (Exception ex)
             {
-                // Swallow unload-time exceptions to avoid blocking Burp unload workflow.
+                api.logging().logToError("[OpenAPI Sampler] Unable to dispose tab during unload", ex);
             }
         }
 
@@ -87,9 +87,9 @@ public final class OpenApiSamplerExtension implements BurpExtension, ExtensionUn
                 registration.deregister();
             }
         }
-        catch (Exception ignored)
+        catch (Exception ex)
         {
-            // Ignore deregistration failures during unload.
+            api.logging().logToError("[OpenAPI Sampler] Unable to deregister during unload", ex);
         }
     }
 }

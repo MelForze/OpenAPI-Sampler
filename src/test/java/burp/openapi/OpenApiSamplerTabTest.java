@@ -1,6 +1,9 @@
 package burp.openapi;
 
 import burp.api.montoya.core.ToolType;
+import burp.api.montoya.core.ByteArray;
+import burp.api.montoya.http.RequestOptions;
+import org.mockito.ArgumentCaptor;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import burp.api.montoya.http.message.responses.HttpResponse;
@@ -45,6 +48,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.contains;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
@@ -99,13 +103,13 @@ final class OpenApiSamplerTabTest
         HttpRequest noSpecRequest = mock(HttpRequest.class);
         when(noSpecRequest.url()).thenReturn("https://api.example/index.html");
         HttpResponse response = mock(HttpResponse.class);
-        when(response.bodyToString()).thenReturn("""
-                openapi: 3.0.1
-                paths:
-                  /users:
-                    get:
-                      summary: list
-                """);
+        when(response.headerValue("Content-Type")).thenReturn("application/yaml");
+        byte[] specBytes = "openapi: 3.0.1\npaths:\n  /users:\n    get: {}\n".getBytes(StandardCharsets.UTF_8);
+        ByteArray body = mock(ByteArray.class);
+        when(body.length()).thenReturn(specBytes.length);
+        when(body.subArray(0, specBytes.length)).thenReturn(body);
+        when(body.getBytes()).thenReturn(specBytes);
+        when(response.body()).thenReturn(body);
         when(bodyResponse.request()).thenReturn(noSpecRequest);
         when(bodyResponse.response()).thenReturn(response);
 
@@ -113,6 +117,154 @@ final class OpenApiSamplerTabTest
         when(bodyEvent.isFromTool(ToolType.TARGET)).thenReturn(true);
         when(bodyEvent.selectedRequestResponses()).thenReturn(List.of(bodyResponse));
         assertEquals(1, tab.provideMenuItems(bodyEvent).size());
+    }
+
+    @Test
+    void contextMenuRejectsNonSpecContentTypeWithoutReadingBody()
+    {
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
+        try
+        {
+            HttpResponse response = mock(HttpResponse.class);
+            when(response.headerValue("Content-Type")).thenReturn("text/html; charset=UTF-8");
+            HttpRequestResponse selected = mock(HttpRequestResponse.class);
+            when(selected.response()).thenReturn(response);
+            ContextMenuEvent event = mock(ContextMenuEvent.class);
+            when(event.isFromTool(ToolType.TARGET)).thenReturn(true);
+            when(event.selectedRequestResponses()).thenReturn(List.of(selected));
+
+            assertTrue(tab.provideMenuItems(event).isEmpty());
+            verify(response, never()).body();
+            verify(response, never()).bodyToString();
+        }
+        finally
+        {
+            tab.dispose();
+        }
+    }
+
+    @Test
+    void contextMenuOnlyDecodesBoundedPrefix() throws Exception
+    {
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
+        try
+        {
+            HttpResponse response = mock(HttpResponse.class);
+            when(response.headerValue("Content-Type")).thenReturn("application/vnd.oai.openapi+json; charset=UTF-8");
+            ByteArray body = mock(ByteArray.class);
+            ByteArray prefix = mock(ByteArray.class);
+            when(body.length()).thenReturn(1024 * 1024);
+            when(body.subArray(0, 16 * 1024)).thenReturn(prefix);
+            when(prefix.getBytes()).thenReturn("{\"openapi\":\"3.0.3\",\"paths\":{}}".getBytes(StandardCharsets.UTF_8));
+            when(response.body()).thenReturn(body);
+            HttpRequestResponse selected = mock(HttpRequestResponse.class);
+            when(selected.response()).thenReturn(response);
+            ContextMenuEvent event = mock(ContextMenuEvent.class);
+            when(event.isFromTool(ToolType.TARGET)).thenReturn(true);
+            when(event.selectedRequestResponses()).thenReturn(List.of(selected));
+
+            assertEquals(1, tab.provideMenuItems(event).size());
+            verify(body, never()).getBytes();
+            verify(response, never()).bodyToString();
+
+            when(body.length()).thenReturn(5 * 1024 * 1024 + 1);
+            assertTrue(tab.provideMenuItems(event).isEmpty());
+            verify(body, times(1)).subArray(0, 16 * 1024);
+        }
+        finally
+        {
+            tab.dispose();
+        }
+    }
+
+    @Test
+    void decoderRejectsOversizedBodyAndFile() throws Exception
+    {
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
+        Path file = Files.createTempFile("oversized-openapi-", ".json");
+        try
+        {
+            byte[] oversized = new byte[5 * 1024 * 1024 + 1];
+            assertThrows(IllegalArgumentException.class, () -> invoke(tab, "decodeBytesBestEffort",
+                    new Class<?>[]{byte[].class, String.class, String.class}, oversized, "UTF-8", ""));
+            Files.write(file, oversized);
+            assertThrows(IOException.class, () -> invoke(tab, "readSpecFileContent", new Class<?>[]{Path.class}, file));
+        }
+        finally
+        {
+            Files.deleteIfExists(file);
+            tab.dispose();
+        }
+    }
+
+    @Test
+    void montoyaFetchEnforcesTlsVerification() throws Exception
+    {
+        TestApiFactory.ApiContext ctx = TestApiFactory.apiContext();
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(ctx.api);
+        try
+        {
+            HttpRequestResponse result = mock(HttpRequestResponse.class);
+            when(result.hasResponse()).thenReturn(true);
+            HttpResponse response = mock(HttpResponse.class);
+            when(result.response()).thenReturn(response);
+            when(ctx.http.sendRequest(any(HttpRequest.class), any(RequestOptions.class))).thenReturn(result);
+
+            invoke(tab, "fetchViaMontoya", new Class<?>[]{String.class, long.class, long.class, boolean.class},
+                    "https://api.example/openapi.json", 25_000L, 30_000L, true);
+
+            ArgumentCaptor<RequestOptions> options = ArgumentCaptor.forClass(RequestOptions.class);
+            verify(ctx.http).sendRequest(any(HttpRequest.class), options.capture());
+            verify(options.getValue()).withUpstreamTLSVerification();
+            verify(options.getValue()).withResponseTimeout(25_000L);
+        }
+        finally
+        {
+            tab.dispose();
+        }
+    }
+
+    @Test
+    void unloadInterruptsManagedFetchAndLoader() throws Exception
+    {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch interrupted = new CountDownLatch(1);
+        AtomicReference<String> fetchThreadName = new AtomicReference<>();
+        TestApiFactory.ApiContext ctx = TestApiFactory.apiContext();
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(ctx.api, (url, timeoutMs, deadlineMs, redirects) -> {
+            fetchThreadName.set(Thread.currentThread().getName());
+            started.countDown();
+            try
+            {
+                new CountDownLatch(1).await();
+                throw new AssertionError("Fetch should be interrupted");
+            }
+            catch (InterruptedException ex)
+            {
+                interrupted.countDown();
+                throw ex;
+            }
+        });
+        ExecutorService loader = (ExecutorService) field(tab, "loadExecutor");
+        Future<?> load = loader.submit(() -> {
+            assertThrows(IOException.class, () -> invoke(tab, "fetchUrl", new Class<?>[]{String.class},
+                    "https://hang.example/openapi.json"));
+        });
+        try
+        {
+            assertTrue(started.await(2, TimeUnit.SECONDS));
+            tab.dispose();
+            assertTrue(interrupted.await(2, TimeUnit.SECONDS));
+            load.get(2, TimeUnit.SECONDS);
+            assertTrue(loader.awaitTermination(2, TimeUnit.SECONDS));
+            ExecutorService workers = (ExecutorService) field(tab, "workerPool");
+            assertTrue(workers.awaitTermination(2, TimeUnit.SECONDS));
+            assertEquals("openapi-sampler-worker", fetchThreadName.get());
+        }
+        finally
+        {
+            tab.dispose();
+        }
     }
 
     @Test
@@ -446,6 +598,7 @@ final class OpenApiSamplerTabTest
         finally
         {
             releaseFetch.countDown();
+            tab.dispose();
         }
     }
 
@@ -1037,8 +1190,62 @@ final class OpenApiSamplerTabTest
         tab.dispose();
 
         assertTrue(workerPool.isShutdown());
+        assertTrue(((ExecutorService) field(tab, "loadExecutor")).isShutdown());
         // Unloading the extension must not destroy the user's scan task (it holds scan results).
         verify(audit, never()).delete();
+    }
+
+    @Test
+    void disposeLogsUiCleanupFailureAndStillShutsDownExecutors() throws Exception
+    {
+        TestApiFactory.ApiContext ctx = TestApiFactory.apiContext();
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(ctx.api);
+        doThrow(new IllegalStateException("editor cleanup failed")).when(ctx.requestEditor).setRequest(any(HttpRequest.class));
+
+        tab.dispose();
+
+        assertTrue(((ExecutorService) field(tab, "workerPool")).isShutdown());
+        assertTrue(((ExecutorService) field(tab, "loadExecutor")).isShutdown());
+        verify(ctx.logging).logToError(contains("Unable to clear the UI during unload"));
+        verify(ctx.logging).logToError(any(Throwable.class));
+    }
+
+    @Test
+    void unloadStopsSendingRemainingBatchRequests() throws Exception
+    {
+        TestApiFactory.ApiContext ctx = TestApiFactory.apiContext();
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(ctx.api);
+        OpenApiSamplerModel model = (OpenApiSamplerModel) field(tab, "model");
+        model.load(spec("https://scan.example", "/one"), "one");
+        model.load(spec("https://scan.example", "/two"), "two");
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch interrupted = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            started.countDown();
+            try
+            {
+                new CountDownLatch(1).await();
+            }
+            catch (InterruptedException ex)
+            {
+                interrupted.countDown();
+                Thread.currentThread().interrupt();
+            }
+            return null;
+        }).when(ctx.repeater).sendToRepeater(any(HttpRequest.class), any(String.class));
+        try
+        {
+            invoke(tab, "sendSelectedToRepeater", new Class<?>[]{List.class}, List.copyOf(model.operations()));
+            assertTrue(started.await(2, TimeUnit.SECONDS));
+            tab.dispose();
+            assertTrue(interrupted.await(2, TimeUnit.SECONDS));
+            assertTrue(((ExecutorService) field(tab, "workerPool")).awaitTermination(2, TimeUnit.SECONDS));
+            verify(ctx.repeater, times(1)).sendToRepeater(any(HttpRequest.class), any(String.class));
+        }
+        finally
+        {
+            tab.dispose();
+        }
     }
 
     @Test

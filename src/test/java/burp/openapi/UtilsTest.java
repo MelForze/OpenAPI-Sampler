@@ -9,6 +9,9 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 final class UtilsTest
 {
@@ -113,6 +116,19 @@ final class UtilsTest
         assertTrue(script.contains("\"X-Api-Key\": \"abc123\""));
         assertFalse(script.contains("Content-Length"));
         assertTrue(script.contains("requests.request(\"PATCH\", url, headers=headers, data=payload)"));
+    }
+
+    @Test
+    void exportPropagatesBodyReadFailuresToTheLoggingCaller()
+    {
+        HttpRequest request = mock(HttpRequest.class);
+        when(request.url()).thenReturn("https://api.example/users");
+        when(request.method()).thenReturn("POST");
+        when(request.headers()).thenReturn(List.of());
+        when(request.bodyToString()).thenThrow(new IllegalStateException("body unavailable"));
+
+        assertThrows(IllegalStateException.class, () -> Utils.toCurl(request));
+        assertThrows(IllegalStateException.class, () -> Utils.toPythonRequests(request));
     }
 
     @Test

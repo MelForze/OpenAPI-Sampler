@@ -1,6 +1,7 @@
 package burp.openapi;
 
 import burp.api.montoya.MontoyaApi;
+import burp.api.montoya.core.ByteArray;
 import burp.api.montoya.core.ToolType;
 import burp.api.montoya.http.RedirectionMode;
 import burp.api.montoya.http.RequestOptions;
@@ -46,6 +47,7 @@ import java.io.IOException;
 import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.charset.Charset;
+import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -60,13 +62,14 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.FutureTask;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -89,7 +92,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
     private static final int MAX_CONCURRENT_URL_FETCHES = 1;
     private static final long RESPONSE_TIMEOUT_MS = 25_000L;
     private static final long PER_ATTEMPT_DEADLINE_MS = 30_000L;
-    private static final long CANCEL_POLL_INTERVAL_MS = 150L;
+    private static final int CONTEXT_PROBE_SIZE_BYTES = 16 * 1024;
     private static final int MAX_SPEC_SIZE_BYTES = 5 * 1024 * 1024;
     private static final String STATE_URL_FIELD = "ui.urlField";
     private static final String STATE_FILTER_FIELD = "ui.filterField";
@@ -111,6 +114,10 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
     private final OpenApiSamplerTable table;
     private final RequestGenerator requestGenerator;
     private final ExecutorService workerPool;
+    // Load coordinators wait for HTTP futures; keep them outside the pool executing those futures.
+    private final ExecutorService loadExecutor;
+    private final Object fetchLock = new Object();
+    private final Set<Future<FetchResponse>> activeFetches = new LinkedHashSet<>();
     private final SpecFetcher specFetcher;
 
     private final JButton loadFileButton;
@@ -159,6 +166,12 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         this.specFetcher = specFetcher != null ? specFetcher : this::fetchViaMontoya;
         this.workerPool = Executors.newFixedThreadPool(2, runnable -> {
             Thread worker = new Thread(runnable, "openapi-sampler-worker");
+            worker.setDaemon(true);
+            return worker;
+        });
+
+        this.loadExecutor = Executors.newSingleThreadExecutor(runnable -> {
+            Thread worker = new Thread(runnable, "openapi-sampler-loader");
             worker.setDaemon(true);
             return worker;
         });
@@ -373,27 +386,15 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             return;
         }
 
-        cancelRequested = true;
+        cancelActiveFetches();
         loadingInProgress = false;
-        filterDebounceTimer.stop();
         // Intentionally do NOT delete the user's scan tasks here: unloading the extension must leave
         // their running/finished Active/Passive scans (and results) intact in the Burp dashboard.
         lastLoadFailures.clear();
 
-        workerPool.shutdown();
-        try
-        {
-            if (!workerPool.awaitTermination(3, TimeUnit.SECONDS))
-            {
-                workerPool.shutdownNow();
-                workerPool.awaitTermination(2, TimeUnit.SECONDS);
-            }
-        }
-        catch (InterruptedException interrupted)
-        {
-            workerPool.shutdownNow();
-            Thread.currentThread().interrupt();
-        }
+        loadExecutor.shutdownNow();
+        workerPool.shutdownNow();
+        // Do not wait on the EDT: a load coordinator may be waiting to publish its result there.
 
         try
         {
@@ -406,14 +407,20 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
                 SwingUtilities.invokeAndWait(this::clearUiForDispose);
             }
         }
-        catch (Exception ignored)
+        catch (InterruptedException ex)
         {
-            // Best-effort cleanup; unload should proceed even if UI teardown fails.
+            Thread.currentThread().interrupt();
+            logError("Interrupted while clearing the UI during unload", ex);
+        }
+        catch (Exception ex)
+        {
+            logError("Unable to clear the UI during unload", ex);
         }
     }
 
     private void clearUiForDispose()
     {
+        filterDebounceTimer.stop();
         table.dispose();
         model.clear();
         sourceSelector.removeAllItems();
@@ -432,7 +439,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
     @Override
     public List<Component> provideMenuItems(ContextMenuEvent event)
     {
-        if (event == null)
+        if (disposed.get() || event == null)
         {
             return Collections.emptyList();
         }
@@ -450,7 +457,11 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
 
         HttpRequestResponse first = selected.get(0);
         String requestUrl = extractRequestUrl(first);
-        String responseBody = extractResponseBody(first);
+        if (first != null && first.response() != null && !isSpecContentType(first.response()))
+        {
+            return Collections.emptyList();
+        }
+        String responseBody = probeResponseBody(first);
 
         boolean hasOpenApiUrl = Utils.looksLikeOpenApiUrl(requestUrl);
         boolean hasOpenApiBody = Utils.looksLikeOpenApiSpec(responseBody);
@@ -464,7 +475,8 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         menuItem.addActionListener(e -> {
             if (hasOpenApiBody)
             {
-                parseAndDisplaySpecAsync(responseBody, "context response", requestUrl, false, "Parsing context response...");
+                runBackgroundLoad("Parsing context response...",
+                        () -> parseSpec(extractResponseBody(first), "context response", requestUrl, false), "Context response");
                 return;
             }
 
@@ -557,7 +569,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
                     {
                         throw new CompletionException(ex);
                     }
-                }, workerPool)
+                }, loadExecutor)
                 .whenComplete((result, throwable) -> SwingUtilities.invokeLater(() -> {
                     if (disposed.get())
                     {
@@ -643,6 +655,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
                 String failure = url + " -> " + Utils.coalesce(ex.getMessage(), ex.getClass().getSimpleName());
                 failures.add(failure);
                 registerLoadFailure(url, Utils.coalesce(ex.getMessage(), ex.getClass().getSimpleName()));
+                logError("URL list source load failed", ex);
             }
             processed++;
             publishUrlListProgress(processed, parsed.urls().size(), "Processed " + url);
@@ -846,7 +859,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             URI uri = URI.create("https://" + candidate);
             return Utils.nonBlank(uri.getHost());
         }
-        catch (Exception ignored)
+        catch (IllegalArgumentException ignored)
         {
             return false;
         }
@@ -918,6 +931,10 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             }
             catch (Exception fetchEx)
             {
+                if (isCancellationError(fetchEx))
+                {
+                    throw fetchEx;
+                }
                 attemptErrors.add(candidate + " -> fetch: " + conciseError(fetchEx));
             }
         }
@@ -949,7 +966,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         IOException lastError = null;
         for (int attempt = 1; attempt <= MAX_FETCH_RETRIES; attempt++)
         {
-            if (cancelRequested)
+            if (cancelRequested || disposed.get() || Thread.currentThread().isInterrupted())
             {
                 throw new IOException("Canceled by user");
             }
@@ -1007,6 +1024,10 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             }
             catch (Exception ex)
             {
+                if (cancelRequested || disposed.get() || Thread.currentThread().isInterrupted())
+                {
+                    throw new IOException("Canceled by user", ex);
+                }
                 lastError = new IOException(Utils.coalesce(ex.getMessage(), ex.getClass().getSimpleName()), ex);
                 if (attempt >= MAX_FETCH_RETRIES)
                 {
@@ -1020,54 +1041,63 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         throw lastError == null ? new IOException("Unknown fetch error") : lastError;
     }
 
-    /**
-     * Runs a single fetch on a daemon thread while polling the cancel flag, so that clicking
-     * "Cancel load" abandons an in-flight request promptly instead of blocking the worker until
-     * the per-attempt deadline (or the server) finally responds.
-     */
+    /** Submits HTTP work to the managed pool; cancellation directly wakes the waiting loader. */
     private FetchResponse fetchWithCancellation(String candidateUrl) throws Exception
     {
-        FutureTask<FetchResponse> fetchTask = new FutureTask<>(() ->
-                specFetcher.fetch(candidateUrl, RESPONSE_TIMEOUT_MS, PER_ATTEMPT_DEADLINE_MS, true));
-        Thread fetchThread = new Thread(fetchTask, "openapi-sampler-fetch");
-        fetchThread.setDaemon(true);
-        fetchThread.start();
-
-        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(PER_ATTEMPT_DEADLINE_MS);
-        while (true)
+        Future<FetchResponse> fetchTask;
+        synchronized (fetchLock)
         {
-            if (cancelRequested || disposed.get())
+            if (cancelRequested || disposed.get() || Thread.currentThread().isInterrupted())
             {
-                fetchTask.cancel(true);
                 throw new IOException("Canceled by user");
             }
+            fetchTask = workerPool.submit(() ->
+                    specFetcher.fetch(candidateUrl, RESPONSE_TIMEOUT_MS, PER_ATTEMPT_DEADLINE_MS, true));
+            activeFetches.add(fetchTask);
+        }
+        try
+        {
+            return fetchTask.get(PER_ATTEMPT_DEADLINE_MS, TimeUnit.MILLISECONDS);
+        }
+        catch (CancellationException ex)
+        {
+            throw new IOException("Canceled by user", ex);
+        }
+        catch (TimeoutException ex)
+        {
+            throw new IOException("timeout: attempt deadline exceeded (" + PER_ATTEMPT_DEADLINE_MS + " ms)", ex);
+        }
+        catch (InterruptedException ex)
+        {
+            Thread.currentThread().interrupt();
+            throw new IOException("Canceled by user: interrupted while waiting for response", ex);
+        }
+        catch (ExecutionException ex)
+        {
+            if (ex.getCause() instanceof Exception cause)
+            {
+                throw cause;
+            }
+            throw new IOException("network: " + ex.getMessage(), ex);
+        }
+        finally
+        {
+            fetchTask.cancel(true);
+            synchronized (fetchLock)
+            {
+                activeFetches.remove(fetchTask);
+            }
+        }
+    }
 
-            try
+    private void cancelActiveFetches()
+    {
+        synchronized (fetchLock)
+        {
+            cancelRequested = true;
+            for (Future<FetchResponse> fetch : activeFetches)
             {
-                return fetchTask.get(CANCEL_POLL_INTERVAL_MS, TimeUnit.MILLISECONDS);
-            }
-            catch (TimeoutException pollTimeout)
-            {
-                if (System.nanoTime() >= deadlineNanos)
-                {
-                    fetchTask.cancel(true);
-                    throw new IOException("timeout: attempt deadline exceeded (" + PER_ATTEMPT_DEADLINE_MS + " ms)", pollTimeout);
-                }
-            }
-            catch (InterruptedException interruptedException)
-            {
-                fetchTask.cancel(true);
-                Thread.currentThread().interrupt();
-                throw new IOException("timeout: interrupted while waiting for response", interruptedException);
-            }
-            catch (ExecutionException executionException)
-            {
-                Throwable cause = executionException.getCause();
-                if (cause instanceof Exception ex)
-                {
-                    throw ex;
-                }
-                throw new IOException("network: " + executionException.getMessage(), executionException);
+                fetch.cancel(true);
             }
         }
     }
@@ -1079,6 +1109,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             boolean followRedirects) throws Exception
     {
         RequestOptions requestOptions = RequestOptions.requestOptions()
+                .withUpstreamTLSVerification()
                 .withResponseTimeout(responseTimeoutMs)
                 .withRedirectionMode(followRedirects ? RedirectionMode.ALWAYS : RedirectionMode.NEVER);
 
@@ -1086,8 +1117,8 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
                 .withMethod("GET")
                 .withAddedHeader("Accept", "application/json, application/yaml, text/yaml, */*");
 
-        // The cancellation/deadline wrapper (fetchWithCancellation) runs this on a daemon thread and
-        // enforces the per-attempt deadline, so the request itself only needs the Montoya response timeout.
+        // The managed fetch future enforces the per-attempt deadline and receives cancellation.
+        // Montoya's response timeout also bounds the call if its transport ignores interruption.
         HttpRequestResponse response = api.http().sendRequest(specRequest, requestOptions);
 
         if (response == null || !response.hasResponse() || response.response() == null)
@@ -1175,41 +1206,64 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             return "";
         }
 
-        byte[] bodyBytes = null;
-        try
+        ByteArray body = response.body();
+        if (body != null)
         {
-            if (response.body() != null)
+            if (body.length() > MAX_SPEC_SIZE_BYTES)
             {
-                bodyBytes = response.body().getBytes();
+                throw new IllegalArgumentException("size-limit: response body exceeds max " + MAX_SPEC_SIZE_BYTES + " bytes");
             }
+            return decodeBytesBestEffort(body.getBytes(), detectCharsetFromContentType(response), "");
         }
-        catch (Exception ignored)
-        {
-            bodyBytes = null;
-        }
-
-        String bodyToString = "";
-        try
-        {
-            bodyToString = Utils.coalesce(response.bodyToString());
-        }
-        catch (Exception ignored)
-        {
-            bodyToString = "";
-        }
-
-        if (bodyBytes == null)
-        {
-            return bodyToString;
-        }
-
-        return decodeBytesBestEffort(bodyBytes, detectCharsetFromContentType(response), bodyToString);
+        return decodeBytesBestEffort(null, "", response.bodyToString());
     }
 
     private String readSpecFileContent(Path path) throws IOException
     {
-        byte[] bytes = Files.readAllBytes(path);
-        return decodeBytesBestEffort(bytes, "", "");
+        // Bound the read itself, including files that grow between the size check and the read.
+        try (var input = Files.newInputStream(path))
+        {
+            byte[] bytes = input.readNBytes(MAX_SPEC_SIZE_BYTES + 1);
+            if (bytes.length > MAX_SPEC_SIZE_BYTES)
+            {
+                throw new IOException("size-limit: spec file exceeds max " + MAX_SPEC_SIZE_BYTES + " bytes");
+            }
+            return decodeBytesBestEffort(bytes, "", "");
+        }
+    }
+
+    private boolean isSpecContentType(HttpResponse response)
+    {
+        String type = Utils.safeLower(Utils.coalesce(response.headerValue("Content-Type"))).split(";", 2)[0].trim();
+        return type.equals("application/json") || type.equals("text/json")
+                || type.equals("application/yaml") || type.equals("application/x-yaml")
+                || type.equals("text/yaml") || type.equals("text/x-yaml")
+                || type.endsWith("+json") || type.endsWith("+yaml");
+    }
+
+    private String probeResponseBody(HttpRequestResponse requestResponse)
+    {
+        if (requestResponse == null || requestResponse.response() == null)
+        {
+            return "";
+        }
+        try
+        {
+            HttpResponse response = requestResponse.response();
+            ByteArray body = response.body();
+            if (body == null || body.length() > MAX_SPEC_SIZE_BYTES)
+            {
+                return "";
+            }
+            // Only inspect a bounded prefix on the EDT. Decode the complete spec after selection.
+            byte[] prefix = body.subArray(0, Math.min(body.length(), CONTEXT_PROBE_SIZE_BYTES)).getBytes();
+            return decodeBytesBestEffort(prefix, detectCharsetFromContentType(response), "");
+        }
+        catch (Exception ex)
+        {
+            logError("Unable to inspect context response", ex);
+            return "";
+        }
     }
 
     private boolean startsWith(byte[] bytes, int... prefix)
@@ -1230,6 +1284,11 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
 
     private String decodeBytesBestEffort(byte[] bodyBytes, String charsetFromHeader, String fallback)
     {
+        if ((bodyBytes != null && bodyBytes.length > MAX_SPEC_SIZE_BYTES)
+                || (fallback != null && fallback.length() > MAX_SPEC_SIZE_BYTES))
+        {
+            throw new IllegalArgumentException("size-limit: spec exceeds max " + MAX_SPEC_SIZE_BYTES + " bytes/chars");
+        }
         if (bodyBytes == null || bodyBytes.length == 0)
         {
             return Utils.coalesce(fallback);
@@ -1248,7 +1307,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             {
                 candidates.add(new String(bodyBytes, Charset.forName(charsetFromHeader)));
             }
-            catch (Exception ignored)
+            catch (IllegalArgumentException ignored)
             {
                 // Ignore invalid charset declarations.
             }
@@ -1262,7 +1321,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             {
                 candidates.add(new String(bodyBytes, Charset.forName(detectedCharset)));
             }
-            catch (Exception ignored)
+            catch (IllegalArgumentException ignored)
             {
                 // Ignore invalid auto-detected charset.
             }
@@ -1289,8 +1348,9 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         {
             return detectCharsetFromContentTypeValue(response.headerValue("Content-Type"));
         }
-        catch (Exception ignored)
+        catch (Exception ex)
         {
+            logError("Unable to read response charset", ex);
             return "";
         }
     }
@@ -1351,7 +1411,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             int safeOffset = Math.max(0, Math.min(offset, bytes.length));
             return new String(bytes, safeOffset, bytes.length - safeOffset, Charset.forName(charsetName));
         }
-        catch (Exception ignored)
+        catch (IllegalArgumentException ignored)
         {
             return "";
         }
@@ -1367,7 +1427,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
                     .decode(java.nio.ByteBuffer.wrap(bytes))
                     .toString();
         }
-        catch (Exception ignored)
+        catch (CharacterCodingException ignored)
         {
             return "";
         }
@@ -1383,7 +1443,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
                     .decode(java.nio.ByteBuffer.wrap(bytes))
                     .toString();
         }
-        catch (Exception ignored)
+        catch (CharacterCodingException ignored)
         {
             return new String(bytes, StandardCharsets.UTF_8);
         }
@@ -1599,7 +1659,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
                 return resolved.toString();
             }
         }
-        catch (Exception ignored)
+        catch (IllegalArgumentException ignored)
         {
             return "";
         }
@@ -1617,7 +1677,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         {
             return URLDecoder.decode(value, StandardCharsets.UTF_8);
         }
-        catch (Exception ignored)
+        catch (IllegalArgumentException ignored)
         {
             return value;
         }
@@ -1663,7 +1723,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
                 return false;
             }
         }
-        catch (Exception ignored)
+        catch (IllegalArgumentException ignored)
         {
             return false;
         }
@@ -1683,7 +1743,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         {
             return Utils.coalesce(URI.create(url).getHost());
         }
-        catch (Exception ignored)
+        catch (IllegalArgumentException ignored)
         {
             return "";
         }
@@ -1764,22 +1824,6 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         persistUiState();
     }
 
-    private void parseAndDisplaySpecAsync(
-            String rawSpec,
-            String sourceLabel,
-            String sourceLocation,
-            boolean preferLocationParsing,
-            String statusMessage)
-    {
-        if (Utils.isBlank(rawSpec) && !preferLocationParsing)
-        {
-            showError("Parse error", "Specification content is empty.");
-            return;
-        }
-
-        runBackgroundLoad(statusMessage, () -> parseSpec(rawSpec, sourceLabel, sourceLocation, preferLocationParsing), "Parse");
-    }
-
     private ParseOutcome parseSpec(String rawSpec, String sourceLabel, String sourceLocation, boolean preferLocationParsing) throws Exception
     {
         log("Parsing spec from " + sourceLabel);
@@ -1848,7 +1892,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
                     {
                         throw new CompletionException(ex);
                     }
-                }, workerPool)
+                }, loadExecutor)
                 .whenComplete((outcome, throwable) -> SwingUtilities.invokeLater(() -> {
                     if (disposed.get())
                     {
@@ -1882,6 +1926,10 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
 
     private int applyParseOutcome(ParseOutcome outcome)
     {
+        if (disposed.get())
+        {
+            return 0;
+        }
         int previousCount = model.operations().size();
         model.load(outcome.openAPI(), outcome.sourceLocation(), outcome.sourceLabel());
         refreshSourceSelector();
@@ -1953,7 +2001,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             return;
         }
 
-        cancelRequested = true;
+        cancelActiveFetches();
         progressLabel.setText("Progress: cancel requested...");
         statusLabel.setText("Cancellation requested. Waiting for current request to finish...");
     }
@@ -1961,6 +2009,10 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
     private void publishUrlListProgress(int processed, int total, String current)
     {
         SwingUtilities.invokeLater(() -> {
+            if (disposed.get())
+            {
+                return;
+            }
             String suffix = Utils.nonBlank(current) ? " - " + current : "";
             progressLabel.setText("Progress: " + processed + "/" + total + suffix);
         });
@@ -2123,6 +2175,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         }
         catch (Exception ex)
         {
+            logError("Unable to access extension persistence", ex);
             return null;
         }
     }
@@ -2186,7 +2239,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
                     {
                         throw new CompletionException(ex);
                     }
-                }, workerPool)
+                }, loadExecutor)
                 .whenComplete((result, throwable) -> SwingUtilities.invokeLater(() -> {
                     if (disposed.get())
                     {
@@ -2255,6 +2308,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
                 }
                 failures.add(source + " -> " + Utils.coalesce(ex.getMessage(), ex.getClass().getSimpleName()));
                 registerLoadFailure(source, Utils.coalesce(ex.getMessage(), ex.getClass().getSimpleName()));
+                logError("Saved source load failed", ex);
             }
             processed++;
             publishUrlListProgress(processed, sources.size(), "Restored " + source);
@@ -2522,6 +2576,10 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             int failed = 0;
             for (OpenApiSamplerModel.OperationContext operation : operations)
             {
+                if (disposed.get() || Thread.currentThread().isInterrupted())
+                {
+                    break;
+                }
                 try
                 {
                     HttpRequest request = generateRequest(operation, context);
@@ -2749,7 +2807,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             }
             return Utils.stripTrailingSlash(uri.toString());
         }
-        catch (Exception ignored)
+        catch (IllegalArgumentException ignored)
         {
             return "";
         }
@@ -2791,6 +2849,10 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             int failed = 0;
             for (OpenApiSamplerModel.OperationContext operation : selected)
             {
+                if (disposed.get() || Thread.currentThread().isInterrupted())
+                {
+                    break;
+                }
                 try
                 {
                     HttpRequest request = generateRequest(operation, context);
@@ -2832,9 +2894,9 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
                 }
             }
         }
-        catch (Exception ignored)
+        catch (Exception ex)
         {
-            // Keep fallback host when request URL cannot be parsed.
+            logError("Unable to determine Repeater request host", ex);
         }
 
         try
@@ -2844,9 +2906,9 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
                 endpoint = request.pathWithoutQuery();
             }
         }
-        catch (Exception ignored)
+        catch (Exception ex)
         {
-            // Keep operation-path fallback.
+            logError("Unable to determine Repeater request path", ex);
         }
 
         return "OpenAPI Sampler / " + bucket + " / " + host + " / " + method + " " + endpoint;
@@ -2861,6 +2923,10 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             int failed = 0;
             for (OpenApiSamplerModel.OperationContext operation : selected)
             {
+                if (disposed.get() || Thread.currentThread().isInterrupted())
+                {
+                    break;
+                }
                 try
                 {
                     HttpRequest request = generateRequest(operation, context);
@@ -2893,7 +2959,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         String mode = active ? "Active" : "Passive";
         GenerationContext context = generationContextSnapshot();
         statusLabel.setText(mode + " scan: queuing " + selected.size() + " request(s)...");
-        workerPool.submit(() -> queueSelectedForAudit(selected, active, context));
+        submitGenerationTask(() -> queueSelectedForAudit(selected, active, context));
     }
 
     private void queueSelectedForAudit(
@@ -2901,6 +2967,10 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             boolean active,
             GenerationContext context)
     {
+        if (disposed.get() || Thread.currentThread().isInterrupted())
+        {
+            return;
+        }
         String mode = active ? "Active" : "Passive";
         Audit audit;
         try
@@ -2930,6 +3000,10 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         int retried = 0;
         for (OpenApiSamplerModel.OperationContext operation : selected)
         {
+            if (disposed.get() || Thread.currentThread().isInterrupted())
+            {
+                break;
+            }
             HttpRequest request;
             try
             {
@@ -2949,6 +3023,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             }
             catch (Exception addEx)
             {
+                logError(mode + " scan addRequest failed", addEx);
                 if (!isAuditTaskUsable(audit))
                 {
                     try
@@ -3001,8 +3076,9 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             task.requestCount();
             return true;
         }
-        catch (Exception ignored)
+        catch (Exception ex)
         {
+            logError("Unable to inspect audit task", ex);
             return false;
         }
     }
@@ -3028,6 +3104,10 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
 
             for (OpenApiSamplerModel.OperationContext operation : selected)
             {
+                if (disposed.get() || Thread.currentThread().isInterrupted())
+                {
+                    break;
+                }
                 try
                 {
                     HttpRequest request = generateRequest(operation, context);
@@ -3061,6 +3141,10 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
 
             for (OpenApiSamplerModel.OperationContext operation : selected)
             {
+                if (disposed.get() || Thread.currentThread().isInterrupted())
+                {
+                    break;
+                }
                 try
                 {
                     HttpRequest request = generateRequest(operation, context);
@@ -3190,9 +3274,9 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
                     server = uri.getScheme() + "://" + uri.getAuthority();
                 }
             }
-            catch (Exception ignored)
+            catch (Exception ex)
             {
-                // Keep full URL fallback.
+                logError("Unable to determine export server; using full URL", ex);
             }
 
             all.append("Source: ").append(Utils.coalesce(operation.sourceLabel(), operation.sourceId())).append('\n');
@@ -3415,8 +3499,9 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
                     ? requestResponse.request().url()
                     : "";
         }
-        catch (Exception ignored)
+        catch (Exception ex)
         {
+            logError("Unable to read context request URL", ex);
             return "";
         }
     }
@@ -3429,8 +3514,9 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
                     ? decodeResponseBody(requestResponse.response())
                     : "";
         }
-        catch (Exception ignored)
+        catch (Exception ex)
         {
+            logError("Unable to decode context response", ex);
             return "";
         }
     }
@@ -3442,7 +3528,12 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
 
     private void setStatusOnEdt(String text)
     {
-        SwingUtilities.invokeLater(() -> statusLabel.setText(text));
+        SwingUtilities.invokeLater(() -> {
+            if (!disposed.get())
+            {
+                statusLabel.setText(text);
+            }
+        });
     }
 
     /**
@@ -3458,7 +3549,10 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         workerPool.submit(() -> {
             try
             {
-                backgroundWork.run();
+                if (!disposed.get() && !Thread.currentThread().isInterrupted())
+                {
+                    backgroundWork.run();
+                }
             }
             catch (Exception ex)
             {
@@ -3474,8 +3568,9 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             Component suiteFrame = api.userInterface().swingUtils().suiteFrame();
             return suiteFrame != null ? suiteFrame : rootPanel;
         }
-        catch (Exception ignored)
+        catch (Exception ex)
         {
+            logError("Unable to access Burp suite frame", ex);
             return rootPanel;
         }
     }
@@ -3492,7 +3587,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         api.logging().raiseErrorEvent(EXTENSION_PREFIX + message);
         if (ex != null)
         {
-            api.logging().logToError(EXTENSION_PREFIX + "Exception type: " + ex.getClass().getSimpleName());
+            api.logging().logToError(ex);
         }
     }
 

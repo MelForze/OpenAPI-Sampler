@@ -154,7 +154,7 @@ public final class Utils
                     .append("'");
         }
 
-        String body = safeBody(request);
+        String body = request.bodyToString();
         if (nonBlank(body))
         {
             sb.append(" \\\n  --data-raw '").append(escapeShellSingleQuoted(body)).append("'");
@@ -180,7 +180,7 @@ public final class Utils
             headers.put(name, header.value());
         }
 
-        String body = safeBody(request);
+        String body = request.bodyToString();
 
         StringBuilder sb = new StringBuilder();
         sb.append("import requests\n\n");
@@ -336,18 +336,6 @@ public final class Utils
     private static boolean isCyrillic(char ch)
     {
         return (ch >= '\u0400' && ch <= '\u04FF') || ch == 'Ё' || ch == 'ё';
-    }
-
-    private static String safeBody(HttpRequest request)
-    {
-        try
-        {
-            return request.bodyToString();
-        }
-        catch (Exception ignored)
-        {
-            return "";
-        }
     }
 
     private static String escapeShellSingleQuoted(String input)

@@ -5,7 +5,7 @@ This document tracks the repository assets and metadata prepared for BApp Store 
 ## Extension Identity
 
 - Name: `OpenAPI Sampler`
-- Version: `2.2.0`
+- Version: `2.2.1`
 - Author: `MelForze`
 - Type: `Java (Montoya API)`
 - Entry point: `burp.openapi.OpenApiSamplerExtension`
@@ -65,4 +65,4 @@ mvn -q -DskipTests package
 
 Produced artifact:
 
-- `target/openapi-sampler-2.2.0.jar`
+- `target/openapi-sampler-2.2.1.jar`
