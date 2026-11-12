@@ -1,5 +1,8 @@
 package burp.openapi;
 
+import burp.IBurpExtenderCallbacks;
+import burp.IScanQueueItem;
+
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.core.Registration;
 import burp.api.montoya.extension.Extension;
@@ -24,6 +27,8 @@ import java.util.concurrent.ConcurrentHashMap;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -117,6 +122,7 @@ final class TestApiFactory
 
     static final class ApiContext
     {
+        final IBurpExtenderCallbacks activeScanCallbacks = mock(IBurpExtenderCallbacks.class);
         final MontoyaApi api;
         final Extension extension;
         final UserInterface userInterface;
@@ -134,6 +140,13 @@ final class TestApiFactory
         final Registration suiteTabRegistration;
         final Registration contextMenuRegistration;
         final Registration unloadingRegistration;
+
+        ActiveScanQueue activeScanQueue()
+        {
+            ActiveScanQueue queue = new ActiveScanQueue();
+            queue.initialize(activeScanCallbacks);
+            return queue;
+        }
 
         private ApiContext(
                 MontoyaApi api,
@@ -154,6 +167,8 @@ final class TestApiFactory
                 Registration contextMenuRegistration,
                 Registration unloadingRegistration)
         {
+            when(activeScanCallbacks.doActiveScan(anyString(), anyInt(), anyBoolean(), any(byte[].class)))
+                    .thenAnswer(invocation -> mock(IScanQueueItem.class));
             this.api = api;
             this.extension = extension;
             this.userInterface = userInterface;

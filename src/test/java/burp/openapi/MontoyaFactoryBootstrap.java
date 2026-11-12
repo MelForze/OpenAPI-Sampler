@@ -1,6 +1,8 @@
 package burp.openapi;
 
 import burp.api.montoya.core.Range;
+import burp.api.montoya.core.ByteArray;
+import java.nio.charset.StandardCharsets;
 import burp.api.montoya.http.HttpService;
 import burp.api.montoya.http.RequestOptions;
 import burp.api.montoya.http.message.HttpHeader;
@@ -59,6 +61,15 @@ final class MontoyaFactoryBootstrap
 
         ObjectFactoryLocator.FACTORY = factory;
         installed = true;
+    }
+
+    private static ByteArray requestBytes(String request)
+    {
+        byte[] bytes = request.getBytes(StandardCharsets.UTF_8);
+        ByteArray result = Mockito.mock(ByteArray.class);
+        when(result.getBytes()).thenReturn(bytes);
+        when(result.length()).thenReturn(bytes.length);
+        return result;
     }
 
     private static Range rangeProxy(int start, int end)
@@ -255,6 +266,7 @@ final class MontoyaFactoryBootstrap
                 case "bodyToString" -> body;
                 case "bodyOffset" -> rawPrefixLength();
                 case "toString" -> rawRequest();
+                case "toByteArray" -> requestBytes(rawRequest());
                 case "httpService" -> toHttpService(url);
                 case "withMethod" -> proxy(new HttpRequestProxy(url, stringArg(args, 0), headers, body));
                 case "withBody" -> proxy(new HttpRequestProxy(url, method, headers, Objects.toString(args[0], "")));

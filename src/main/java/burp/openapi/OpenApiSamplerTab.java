@@ -119,6 +119,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
     private final Object fetchLock = new Object();
     private final Set<Future<FetchResponse>> activeFetches = new LinkedHashSet<>();
     private final SpecFetcher specFetcher;
+    private final ActiveScanQueue activeScanQueue;
 
     private final JButton loadFileButton;
     private final JButton loadUrlListButton;
@@ -159,7 +160,13 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
 
     OpenApiSamplerTab(MontoyaApi api, SpecFetcher specFetcher)
     {
+        this(api, specFetcher, new ActiveScanQueue());
+    }
+
+    OpenApiSamplerTab(MontoyaApi api, SpecFetcher specFetcher, ActiveScanQueue activeScanQueue)
+    {
         this.api = Objects.requireNonNull(api, "api must not be null");
+        this.activeScanQueue = Objects.requireNonNull(activeScanQueue, "activeScanQueue must not be null");
         this.model = new OpenApiSamplerModel();
         this.table = new OpenApiSamplerTable();
         this.requestGenerator = new RequestGenerator();
@@ -387,6 +394,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         }
 
         cancelActiveFetches();
+        activeScanQueue.close();
         loadingInProgress = false;
         // Intentionally do NOT delete the user's scan tasks here: unloading the extension must leave
         // their running/finished Active/Passive scans (and results) intact in the Burp dashboard.
@@ -2971,7 +2979,12 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         {
             return;
         }
-        String mode = active ? "Active" : "Passive";
+        if (active)
+        {
+            queueSelectedForActiveScan(selected, context);
+            return;
+        }
+        String mode = "Passive";
         Audit audit;
         try
         {
@@ -2979,7 +2992,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             // detect that the user deleted a scan task in the dashboard (a deleted Audit handle keeps
             // answering statusMessage()/requestCount() and silently drops addRequest()), so reusing a
             // cached handle could route requests into a task that no longer exists, with no progress.
-            audit = createAuditTask(active);
+            audit = createPassiveAuditTask();
         }
         catch (Exception ex)
         {
@@ -3029,7 +3042,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
                     try
                     {
                         log(mode + " scan task is unavailable. Recreating task and retrying request.");
-                        audit = createAuditTask(active);
+                        audit = createPassiveAuditTask();
                         recreated++;
                         audit.addRequest(request);
                         queued++;
@@ -3083,13 +3096,45 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         }
     }
 
-    private Audit createAuditTask(boolean active)
+    private void queueSelectedForActiveScan(
+            List<OpenApiSamplerModel.OperationContext> selected,
+            GenerationContext context)
     {
-        BuiltInAuditConfiguration configuration = active
-                ? BuiltInAuditConfiguration.LEGACY_ACTIVE_AUDIT_CHECKS
-                : BuiltInAuditConfiguration.LEGACY_PASSIVE_AUDIT_CHECKS;
+        int queued = 0;
+        int failed = 0;
+        for (OpenApiSamplerModel.OperationContext operation : selected)
+        {
+            if (disposed.get() || Thread.currentThread().isInterrupted())
+            {
+                break;
+            }
+            try
+            {
+                HttpRequest request = generateRequest(operation, context);
+                if (disposed.get() || Thread.currentThread().isInterrupted())
+                {
+                    break;
+                }
+                activeScanQueue.submit(request);
+                queued++;
+            }
+            catch (Exception ex)
+            {
+                failed++;
+                logError("Active scan queue failed for " + operation.method() + " " + operation.path(), ex);
+            }
+        }
+        String summary = "Active scan queued: queued=" + queued + ", failed=" + failed + "."
+                + (failed > 0 ? " Check the extension error output for details." : "");
+        setStatusOnEdt(summary);
+        log(summary);
+    }
+
+    private Audit createPassiveAuditTask()
+    {
+        BuiltInAuditConfiguration configuration = BuiltInAuditConfiguration.LEGACY_PASSIVE_AUDIT_CHECKS;
         Audit created = api.scanner().startAudit(AuditConfiguration.auditConfiguration(configuration));
-        log((active ? "Active" : "Passive") + " audit task started.");
+        log("Passive audit task started.");
         return created;
     }
 

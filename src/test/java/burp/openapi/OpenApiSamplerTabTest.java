@@ -1,5 +1,7 @@
 package burp.openapi;
 
+import burp.IScanQueueItem;
+
 import burp.api.montoya.core.ToolType;
 import burp.api.montoya.core.ByteArray;
 import burp.api.montoya.http.RequestOptions;
@@ -46,6 +48,10 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.contains;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
@@ -690,19 +696,15 @@ final class OpenApiSamplerTabTest
     void scopeIsNeverModifiedWhenSendingToScan() throws Exception
     {
         TestApiFactory.ApiContext ctx = TestApiFactory.apiContext();
-        OpenApiSamplerTab tab = new OpenApiSamplerTab(ctx.api);
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(ctx.api, null, ctx.activeScanQueue());
         OpenApiSamplerModel model = (OpenApiSamplerModel) field(tab, "model");
         model.load(spec("https://scan.example", "/users"), "https://scan.example/openapi.json");
 
-        Audit audit = mock(Audit.class);
         CountDownLatch latch = new CountDownLatch(1);
-        when(ctx.scanner.startAudit(any())).thenReturn(audit);
-        when(audit.statusMessage()).thenReturn("running");
-        when(audit.requestCount()).thenReturn(0);
         doAnswer(invocation -> {
             latch.countDown();
-            return null;
-        }).when(audit).addRequest(any(HttpRequest.class));
+            return mock(IScanQueueItem.class);
+        }).when(ctx.activeScanCallbacks).doActiveScan(anyString(), anyInt(), anyBoolean(), any(byte[].class));
 
         invoke(
                 tab,
@@ -716,6 +718,8 @@ final class OpenApiSamplerTabTest
         // N1: the extension must never silently change the user's Burp scope.
         verify(ctx.scope, never()).includeInScope(any(String.class));
         verify(ctx.scope, never()).isInScope(any(String.class));
+        verify(ctx.activeScanCallbacks, never()).includeInScope(any());
+        tab.dispose();
     }
 
     @Test
@@ -939,7 +943,119 @@ final class OpenApiSamplerTabTest
     }
 
     @Test
-    void scanTaskIsCreatedFreshForEachSendSoDeletedTasksAreReplaced() throws Exception
+    void repeatedActiveSendsUseLegacyQueueOffEdtWithoutCreatingAudits() throws Exception
+    {
+        TestApiFactory.ApiContext ctx = TestApiFactory.apiContext();
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(ctx.api, null, ctx.activeScanQueue());
+        OpenApiSamplerModel model = (OpenApiSamplerModel) field(tab, "model");
+        model.load(spec("https://scan.example:8443", "/users"), "https://scan.example/openapi.json");
+        AtomicBoolean usedEdt = new AtomicBoolean(false);
+        doAnswer(invocation -> {
+            usedEdt.set(usedEdt.get() || javax.swing.SwingUtilities.isEventDispatchThread());
+            return mock(IScanQueueItem.class);
+        }).when(ctx.activeScanCallbacks).doActiveScan(anyString(), anyInt(), anyBoolean(), any(byte[].class));
+        try
+        {
+            for (int i = 1; i <= 2; i++)
+            {
+                invoke(tab, "sendSelectedToAudit", new Class<?>[]{List.class, boolean.class}, List.copyOf(model.operations()), true);
+                assertTrue(waitForStatus(tab, text -> text.contains("Active scan queued: queued=1, failed=0")));
+            }
+            verify(ctx.activeScanCallbacks, times(2)).doActiveScan(eq("scan.example"), eq(8443), eq(true), any(byte[].class));
+            verify(ctx.scanner, never()).startAudit(any());
+            assertFalse(usedEdt.get());
+            // No imported configuration or default audit preset may narrow the user's checks.
+            verify(ctx.activeScanCallbacks, never()).loadConfigFromJson(anyString());
+            verify(ctx.activeScanCallbacks, never()).includeInScope(any());
+        }
+        finally
+        {
+            tab.dispose();
+        }
+    }
+
+    @Test
+    void activeQueueFailureIsLoggedWithoutRetryOrMontoyaFallback() throws Exception
+    {
+        TestApiFactory.ApiContext ctx = TestApiFactory.apiContext();
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(ctx.api, null, ctx.activeScanQueue());
+        OpenApiSamplerModel model = (OpenApiSamplerModel) field(tab, "model");
+        model.load(spec("https://scan.example", "/users"), "https://scan.example/openapi.json");
+        RuntimeException failure = new IllegalStateException("Scanner unavailable");
+        when(ctx.activeScanCallbacks.doActiveScan(anyString(), anyInt(), anyBoolean(), any(byte[].class))).thenThrow(failure);
+        try
+        {
+            invoke(tab, "sendSelectedToAudit", new Class<?>[]{List.class, boolean.class}, List.copyOf(model.operations()), true);
+            assertTrue(waitForStatus(tab, text -> text.contains("Active scan queued: queued=0, failed=1")));
+            verify(ctx.activeScanCallbacks, times(1)).doActiveScan(anyString(), anyInt(), anyBoolean(), any(byte[].class));
+            verify(ctx.scanner, never()).startAudit(any());
+            verify(ctx.logging).logToError(failure);
+        }
+        finally
+        {
+            tab.dispose();
+        }
+    }
+
+    @Test
+    void unloadStopsRemainingActiveScanSubmissions() throws Exception
+    {
+        TestApiFactory.ApiContext ctx = TestApiFactory.apiContext();
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(ctx.api, null, ctx.activeScanQueue());
+        OpenApiSamplerModel model = (OpenApiSamplerModel) field(tab, "model");
+        model.load(spec("https://scan.example", "/one"), "one");
+        model.load(spec("https://scan.example", "/two"), "two");
+        assertEquals(2, model.operations().size());
+        CountDownLatch started = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            started.countDown();
+            try
+            {
+                new CountDownLatch(1).await();
+            }
+            catch (InterruptedException ex)
+            {
+                Thread.currentThread().interrupt();
+            }
+            return mock(IScanQueueItem.class);
+        }).when(ctx.activeScanCallbacks).doActiveScan(anyString(), anyInt(), anyBoolean(), any(byte[].class));
+        try
+        {
+            invoke(tab, "sendSelectedToAudit", new Class<?>[]{List.class, boolean.class}, List.copyOf(model.operations()), true);
+            assertTrue(started.await(2, TimeUnit.SECONDS));
+            tab.dispose();
+            assertTrue(((ExecutorService) field(tab, "workerPool")).awaitTermination(2, TimeUnit.SECONDS));
+            verify(ctx.activeScanCallbacks, times(1)).doActiveScan(anyString(), anyInt(), anyBoolean(), any(byte[].class));
+            verify(ctx.scanner, never()).startAudit(any());
+        }
+        finally
+        {
+            tab.dispose();
+        }
+    }
+
+    @Test
+    void missingLegacyCallbacksFailVisiblyWithoutCreatingAnAudit() throws Exception
+    {
+        TestApiFactory.ApiContext ctx = TestApiFactory.apiContext();
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(ctx.api);
+        OpenApiSamplerModel model = (OpenApiSamplerModel) field(tab, "model");
+        model.load(spec("https://scan.example", "/users"), "https://scan.example/openapi.json");
+        try
+        {
+            invoke(tab, "sendSelectedToAudit", new Class<?>[]{List.class, boolean.class}, List.copyOf(model.operations()), true);
+            assertTrue(waitForStatus(tab, text -> text.contains("Active scan queued: queued=0, failed=1")));
+            verify(ctx.scanner, never()).startAudit(any());
+            verify(ctx.logging).logToError(any(IllegalStateException.class));
+        }
+        finally
+        {
+            tab.dispose();
+        }
+    }
+
+    @Test
+    void passiveTaskIsCreatedFreshForEachSendSoDeletedTasksAreReplaced() throws Exception
     {
         TestApiFactory.ApiContext ctx = TestApiFactory.apiContext();
         OpenApiSamplerTab tab = new OpenApiSamplerTab(ctx.api);
@@ -971,7 +1087,7 @@ final class OpenApiSamplerTabTest
                 tab,
                 "onSelectionAction",
                 new Class<?>[]{OpenApiSamplerTable.SelectionAction.class, List.class},
-                OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
+                OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_PASSIVE_SCAN,
                 List.of(model.operations().get(0))
         );
         assertTrue(firstLatch.await(2, TimeUnit.SECONDS));
@@ -980,7 +1096,7 @@ final class OpenApiSamplerTabTest
                 tab,
                 "onSelectionAction",
                 new Class<?>[]{OpenApiSamplerTable.SelectionAction.class, List.class},
-                OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
+                OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_PASSIVE_SCAN,
                 List.of(model.operations().get(0))
         );
         assertTrue(secondLatch.await(2, TimeUnit.SECONDS));
@@ -991,7 +1107,7 @@ final class OpenApiSamplerTabTest
     }
 
     @Test
-    void activeScanTaskIsRecreatedWhenCachedTaskIsUnavailableBeforeQueue() throws Exception
+    void passiveTaskIsCreatedFreshWhenPreviousTaskIsUnavailable() throws Exception
     {
         TestApiFactory.ApiContext ctx = TestApiFactory.apiContext();
         OpenApiSamplerTab tab = new OpenApiSamplerTab(ctx.api);
@@ -1020,7 +1136,7 @@ final class OpenApiSamplerTabTest
                 tab,
                 "onSelectionAction",
                 new Class<?>[]{OpenApiSamplerTable.SelectionAction.class, List.class},
-                OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
+                OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_PASSIVE_SCAN,
                 List.of(model.operations().get(0))
         );
         assertTrue(firstLatch.await(2, TimeUnit.SECONDS));
@@ -1029,7 +1145,7 @@ final class OpenApiSamplerTabTest
                 tab,
                 "onSelectionAction",
                 new Class<?>[]{OpenApiSamplerTable.SelectionAction.class, List.class},
-                OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
+                OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_PASSIVE_SCAN,
                 List.of(model.operations().get(0))
         );
 
@@ -1065,7 +1181,7 @@ final class OpenApiSamplerTabTest
                 tab,
                 "onSelectionAction",
                 new Class<?>[]{OpenApiSamplerTable.SelectionAction.class, List.class},
-                OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
+                OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_PASSIVE_SCAN,
                 List.of(model.operations().get(0))
         );
 
@@ -1098,7 +1214,7 @@ final class OpenApiSamplerTabTest
                 tab,
                 "onSelectionAction",
                 new Class<?>[]{OpenApiSamplerTable.SelectionAction.class, List.class},
-                OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
+                OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_PASSIVE_SCAN,
                 List.of(model.operations().get(0))
         );
 
@@ -1109,53 +1225,33 @@ final class OpenApiSamplerTabTest
     }
 
     @Test
-    void activeAndPassiveScanTasksAreIndependent() throws Exception
+    void activeUsesLegacyQueueWhilePassiveUsesMontoyaAudit() throws Exception
     {
         TestApiFactory.ApiContext ctx = TestApiFactory.apiContext();
-        OpenApiSamplerTab tab = new OpenApiSamplerTab(ctx.api);
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(ctx.api, null, ctx.activeScanQueue());
         OpenApiSamplerModel model = (OpenApiSamplerModel) field(tab, "model");
         model.load(spec("https://scan.example", "/users"), "https://scan.example/openapi.json");
-
-        Audit activeAudit = mock(Audit.class);
         Audit passiveAudit = mock(Audit.class);
-        CountDownLatch activeLatch = new CountDownLatch(1);
+        when(ctx.scanner.startAudit(any())).thenReturn(passiveAudit);
         CountDownLatch passiveLatch = new CountDownLatch(1);
-
-        when(ctx.scanner.startAudit(any())).thenReturn(activeAudit, passiveAudit);
-        when(activeAudit.statusMessage()).thenReturn("running");
-        when(activeAudit.requestCount()).thenReturn(0);
-        when(passiveAudit.statusMessage()).thenReturn("running");
-        when(passiveAudit.requestCount()).thenReturn(0);
-        doAnswer(invocation -> {
-            activeLatch.countDown();
-            return null;
-        }).when(activeAudit).addRequest(any(HttpRequest.class));
         doAnswer(invocation -> {
             passiveLatch.countDown();
             return null;
         }).when(passiveAudit).addRequest(any(HttpRequest.class));
-
-        invoke(
-                tab,
-                "onSelectionAction",
-                new Class<?>[]{OpenApiSamplerTable.SelectionAction.class, List.class},
-                OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
-                List.of(model.operations().get(0))
-        );
-        assertTrue(activeLatch.await(2, TimeUnit.SECONDS));
-
-        invoke(
-                tab,
-                "onSelectionAction",
-                new Class<?>[]{OpenApiSamplerTable.SelectionAction.class, List.class},
-                OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_PASSIVE_SCAN,
-                List.of(model.operations().get(0))
-        );
-        assertTrue(passiveLatch.await(2, TimeUnit.SECONDS));
-
-        verify(ctx.scanner, times(2)).startAudit(any());
-        verify(activeAudit, times(1)).addRequest(any(HttpRequest.class));
-        verify(passiveAudit, times(1)).addRequest(any(HttpRequest.class));
+        try
+        {
+            invoke(tab, "sendSelectedToAudit", new Class<?>[]{List.class, boolean.class}, List.copyOf(model.operations()), true);
+            assertTrue(waitForStatus(tab, text -> text.contains("Active scan queued: queued=1, failed=0")));
+            verify(ctx.scanner, never()).startAudit(any());
+            invoke(tab, "sendSelectedToAudit", new Class<?>[]{List.class, boolean.class}, List.copyOf(model.operations()), false);
+            assertTrue(passiveLatch.await(2, TimeUnit.SECONDS));
+            verify(ctx.activeScanCallbacks).doActiveScan(eq("scan.example"), eq(443), eq(true), any(byte[].class));
+            verify(ctx.scanner, times(1)).startAudit(any());
+        }
+        finally
+        {
+            tab.dispose();
+        }
     }
 
     @Test
@@ -1181,7 +1277,7 @@ final class OpenApiSamplerTabTest
                 tab,
                 "onSelectionAction",
                 new Class<?>[]{OpenApiSamplerTable.SelectionAction.class, List.class},
-                OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
+                OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_PASSIVE_SCAN,
                 List.of(model.operations().get(0))
         );
         assertTrue(latch.await(2, TimeUnit.SECONDS));

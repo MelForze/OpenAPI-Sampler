@@ -56,6 +56,42 @@ URL fetches verify upstream TLS certificates. Specification bodies and local spe
 The Target context menu checks JSON/YAML Content-Types (including `+json`/`+yaml`) and inspects at most
 16 KiB of the response before offering the action; full decoding and parsing run in the background after selection.
 
+## Scanner integration
+
+Active scan submissions use the public `doActiveScan()` API. Burp can place these requests in
+**Extension driven active audit**, which is separate from the **Active scans** task created by
+native UI actions. The public API does not let this extension select an existing Dashboard task
+or configure the extension-driven task's scan checks. The extension does not create a separate
+Montoya active `Audit` for every batch, change target scope, or overwrite Scanner settings.
+Burp handles any confirmation for requests outside the active scanning scope.
+
+For maximum coverage, edit the **Extension driven active audit** task's scan configuration in Burp:
+
+1. Enable all desired built-in issues in **Auditing > Scan checks**, including Passive,
+   Light active, Medium active, Intrusive active, and JavaScript analysis. Check individual issue
+   selections as well as the scan type filters.
+2. Apply **Audit coverage - maximum** from the configuration library. This expands payload and
+   insertion-point coverage; it is separate from selecting the scan check types.
+3. If needed, enable the installed BChecks and extension scan checks separately.
+
+These settings increase scan time and resource usage. Intrusive checks can alter application data.
+See PortSwigger's [audit settings](https://portswigger.net/burp/documentation/scanner/scan-configurations/audit-settings)
+and [built-in configurations](https://portswigger.net/burp/documentation/scanner/scan-configurations/burp-scanner-built-in-configs).
+To add requests to a particular existing task, use Burp's native **Scan > Add to task** action
+from a tool such as Repeater. The extension cannot perform that task selection via the public API.
+
+For programmatic scan creation with a specific scan configuration, PortSwigger documents the
+Desktop REST API as a separate supported integration path. It requires an enabled REST service
+and an API key, and is not implemented by this extension. It must not be confused with submitting
+to a particular existing Dashboard task. See the [PortSwigger API clarification](https://github.com/PortSwigger/burp-extensions-montoya-api/issues/49)
+and [Desktop REST API settings](https://portswigger.net/burp/documentation/desktop/settings/suite/rest-api).
+
+Montoya remains the main API. A small legacy API bridge follows PortSwigger's official
+[multi-API example](https://github.com/PortSwigger/burp-extensions-montoya-api-examples/tree/main/multiapi).
+Both API dependencies are provided by Burp and are excluded from the extension JAR.
+Passive scanning continues to use a separate Montoya audit. Unloading the extension stops new
+submissions and leaves existing scans and results intact.
+
 ## Auth
 
 Auth is optional and applied only to generated requests:

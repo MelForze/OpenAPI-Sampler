@@ -44,6 +44,13 @@ reports/
 tmp/
 temp/
 
+# Local diagnostics and submission drafts
+/lab/
+/tools/scanner-probe/
+/report
+/docs/BAPP_SUBMISSION.md
+/docs/screenshots/README.md
+
 # Secrets / env
 .env
 .env.*

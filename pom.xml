@@ -15,6 +15,7 @@
 
         <!-- Versions validated against Maven Central as of 2026 -->
         <montoya.api.version>2026.2</montoya.api.version>
+        <burp.extender.api.version>2.3</burp.extender.api.version>
         <swagger.parser.v3.version>2.1.37</swagger.parser.v3.version>
         <jackson.databind.version>2.18.4</jackson.databind.version>
         <json.version>20250517</json.version>
@@ -31,6 +32,14 @@
             <groupId>net.portswigger.burp.extensions</groupId>
             <artifactId>montoya-api</artifactId>
             <version>${montoya.api.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- Public legacy API, used only for extension-driven active scan submissions. -->
+        <dependency>
+            <groupId>net.portswigger.burp.extender</groupId>
+            <artifactId>burp-extender-api</artifactId>
+            <version>${burp.extender.api.version}</version>
             <scope>provided</scope>
         </dependency>
 
